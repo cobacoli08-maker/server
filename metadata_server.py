@@ -3,6 +3,9 @@ from flask_cors import CORS
 from ytmusicapi import YTMusic
 import pykakasi
 import os
+import json
+import time
+import requests
 
 app = Flask(__name__)
 CORS(app)
@@ -21,6 +24,23 @@ def text_to_romaji(text):
     if not text:
         return ""
     return converter.do(text).title()
+
+
+def text_to_romaji_spaced(text):
+    if not text:
+        return ""
+    try:
+        parts = []
+        for item in kks.convert(text):
+            romaji = item.get("hepburn") or item.get("kunrei") or item.get("passport") or item.get("orig") or ""
+            romaji = romaji.strip()
+            if romaji:
+                parts.append(romaji)
+        if parts:
+            return " ".join(parts).title()
+    except Exception:
+        pass
+    return text_to_romaji(text)
 
 
 def clean_title(title):
@@ -69,7 +89,7 @@ def cari_metadata():
         raw_album = track_ja.get("album", {}).get("name", "Single") if track_ja.get("album") else "Single"
         video_id = track_ja.get("videoId", "")
 
-        romaji_title = text_to_romaji(raw_title_ja)
+        romaji_title = text_to_romaji_spaced(raw_title_ja)
         if english_title and english_title.lower() not in {romaji_title.lower(), raw_title_ja.lower()}:
             title_combined = f"{raw_title_ja} ({romaji_title} / {english_title})"
         elif raw_title_ja != romaji_title:
@@ -121,6 +141,81 @@ def cari_metadata():
             "year": release_year or "Unknown",
             "cover_url": cover_url,
         })
+
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
+
+@app.post("/upload_decal")
+def upload_decal():
+    roblox_cookie = os.environ.get("ROBLOX_COOKIE", "_|WARNING:-DO-NOT-SHARE-THIS.--Sharing-this-will-allow-someone-to-log-in-as-you-and-to-steal-your-ROBUX-and-items.|_CAEaAhADIhwKBGR1aWQSFDE1NTIxMDY1MDQzNjIwODgyMDczKAM.Yn35UI_0msAy_r_UI_-tIItLZtISPjY-tATNzqc4e6gnKN7T4dL7BbgymYsbHza2K9oLZYtKvPZ7l5U_vg7IOgVCUe_ZXXSoNu7aYQ4Pl_4AODI4EP6fFA15AggceJ1IQG2i1UKdCz11M1PzysYcntLmh85DUNb3fGQAi3PTjJtsuRsS7JxOOK_Qy20ha01l44YweeQKpgsi8h_JTChMQyPrfBu-M-Qxv4zzNfE52yjn5Sytvhe5-Qs9-xi0fR4AGFz7mSQSg9FdeZqbCP3hq0y2HVWClhoMK6rjweMlxvibPPhtANpP53jlOFUlnzW0sy1k620DONp0n5kBapxO9uK_2mXYEiH8u0QX0379NHEDu_TMWBP9cUC0xcuaDLfoI46AgpAHFJJV203mm5Q8Y4sy8Q7QMLkxGreMSuootTrwYTyIzsCMPdq4lN9ricSJBlBaVs3kigloliaDkFTZ2z_5zlHz7uJZEZhHzlMKGsyFJNWiCQKzeX3nuRA_aRkD2ifwrkuhn2OOCQ-88H6d2vWvONokAhVWj8Je1UHBWkwMhuIwq9bJa_qWgLMW91SR78eT-6J6dl9gNcwgtSnnWanXOAbsy8_5TcsXNPqkHIWX3EJjbRsjAzWmMS36hJ5L7CZE_1-z8PCLTRwzugRp-dAAwHcssbzQ7Mh5bDdhhMKLj4BThDxlv1E4Q4CpS7WBc2cKKCorcGwbM7bjq3rlJFBomKVrgdSiLO68VotpnB0K8OeCiEAN63fLVBvOebLWa7rszk4UEkMjaqeyCzSqpyRht8Pvby0YvYDaGR2gjPmSSvjAN-mke8VMYBZx0FNye6p9Wbel6dxlt1wViSL5UcjCjHfgGnYNfV70N7UMNF8zSUFKek8uWtylygp0N2ElZQHDneYXZnlH_6hwWvZUMa7ofreQR-9O8zIsJOMFb0jqiligqaIAZ4hCkdElBnCal1LWxA").strip()
+    if not roblox_cookie:
+        return jsonify({"error": "ROBLOX_COOKIE env is not set"}), 500
+
+    data = request.get_json(silent=True) or {}
+    image_url = (data.get("image_url") or "").strip()
+    decal_name = (data.get("name") or "Karaoke Cover").strip()[:40]
+    if not image_url:
+        return jsonify({"error": "image_url required"}), 400
+
+    try:
+        img_resp = requests.get(image_url, timeout=20)
+        if img_resp.status_code != 200:
+            return jsonify({"error": f"Failed to download image: HTTP {img_resp.status_code}"}), 400
+
+        content_type = img_resp.headers.get("Content-Type", "image/png").split(";")[0]
+        session = requests.Session()
+        session.cookies[".ROBLOSECURITY"] = roblox_cookie
+
+        csrf_resp = session.post("https://auth.roblox.com/v2/logout")
+        csrf_token = csrf_resp.headers.get("x-csrf-token", "")
+        if not csrf_token:
+            return jsonify({"error": "Failed to get Roblox CSRF token"}), 500
+
+        user_resp = session.get("https://users.roblox.com/v1/users/authenticated", timeout=15)
+        user_id = (user_resp.json() if user_resp.ok else {}).get("id")
+        if not user_id:
+            return jsonify({"error": "ROBLOX_COOKIE invalid or expired"}), 500
+
+        req_payload = {
+            "assetType": "Decal",
+            "displayName": decal_name,
+            "description": "Karaoke Cover",
+            "creationContext": {"creator": {"userId": str(user_id)}},
+        }
+        files = {
+            "request": ("", json.dumps(req_payload), "application/json"),
+            "fileContent": ("cover.png", img_resp.content, content_type),
+        }
+        up_resp = session.post(
+            "https://apis.roblox.com/assets/user-auth/v1/assets",
+            headers={"X-CSRF-TOKEN": csrf_token},
+            files=files,
+            timeout=30,
+        )
+        if up_resp.status_code not in (200, 201):
+            return jsonify({"error": f"Roblox API HTTP {up_resp.status_code}", "raw": up_resp.text[:300]}), 500
+
+        op_id = up_resp.json().get("operationId")
+        if not op_id:
+            return jsonify({"error": "Upload response has no operationId"}), 500
+
+        for _ in range(12):
+            time.sleep(2)
+            poll_resp = session.get(
+                f"https://apis.roblox.com/assets/user-auth/v1/operations/{op_id}",
+                headers={"X-CSRF-TOKEN": csrf_token},
+                timeout=15,
+            )
+            if poll_resp.status_code == 200:
+                poll_data = poll_resp.json()
+                if poll_data.get("done"):
+                    asset_id = poll_data.get("response", {}).get("assetId")
+                    if asset_id:
+                        return jsonify({"decal_id": str(asset_id)})
+                    return jsonify({"error": "Upload done but assetId missing"}), 500
+
+        return jsonify({"error": "Timeout waiting for Roblox asset processing"}), 504
 
     except Exception as exc:
         return jsonify({"error": str(exc)}), 500
