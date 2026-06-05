@@ -6,6 +6,7 @@ import os
 import json
 import time
 import requests
+import re
 
 app = Flask(__name__)
 CORS(app)
@@ -29,13 +30,16 @@ def text_to_romaji(text):
 def text_to_romaji_spaced(text):
     if not text:
         return ""
+    particle_re = re.compile(r"(から|まで|より|だけ|って|とは|では|には|でも|[とのにはへをがでやかも])")
     try:
+        chunks = [p for p in particle_re.split(text) if p]
         parts = []
-        for item in kks.convert(text):
-            romaji = item.get("hepburn") or item.get("kunrei") or item.get("passport") or item.get("orig") or ""
-            romaji = romaji.strip()
-            if romaji:
-                parts.append(romaji)
+        for chunk in chunks:
+            for item in kks.convert(chunk):
+                romaji = item.get("hepburn") or item.get("kunrei") or item.get("passport") or item.get("orig") or ""
+                romaji = romaji.strip()
+                if romaji:
+                    parts.append(romaji)
         if parts:
             return " ".join(parts).title()
     except Exception:
@@ -50,6 +54,14 @@ def clean_title(title):
 @app.get("/health")
 def health():
     return jsonify({"ok": True, "service": "karaoke-metadata"})
+
+
+@app.get("/version")
+def version():
+    return jsonify({
+        "version": "2026-06-06-0708",
+        "features": ["romaji_particle_split", "upload_decal"],
+    })
 
 
 @app.post("/cari_metadata")
@@ -148,7 +160,7 @@ def cari_metadata():
 
 @app.post("/upload_decal")
 def upload_decal():
-    roblox_cookie = os.environ.get("ROBLOX_COOKIE", "_|WARNING:-DO-NOT-SHARE-THIS.--Sharing-this-will-allow-someone-to-log-in-as-you-and-to-steal-your-ROBUX-and-items.|_CAEaAhADIhwKBGR1aWQSFDE1NTIxMDY1MDQzNjIwODgyMDczKAM.Yn35UI_0msAy_r_UI_-tIItLZtISPjY-tATNzqc4e6gnKN7T4dL7BbgymYsbHza2K9oLZYtKvPZ7l5U_vg7IOgVCUe_ZXXSoNu7aYQ4Pl_4AODI4EP6fFA15AggceJ1IQG2i1UKdCz11M1PzysYcntLmh85DUNb3fGQAi3PTjJtsuRsS7JxOOK_Qy20ha01l44YweeQKpgsi8h_JTChMQyPrfBu-M-Qxv4zzNfE52yjn5Sytvhe5-Qs9-xi0fR4AGFz7mSQSg9FdeZqbCP3hq0y2HVWClhoMK6rjweMlxvibPPhtANpP53jlOFUlnzW0sy1k620DONp0n5kBapxO9uK_2mXYEiH8u0QX0379NHEDu_TMWBP9cUC0xcuaDLfoI46AgpAHFJJV203mm5Q8Y4sy8Q7QMLkxGreMSuootTrwYTyIzsCMPdq4lN9ricSJBlBaVs3kigloliaDkFTZ2z_5zlHz7uJZEZhHzlMKGsyFJNWiCQKzeX3nuRA_aRkD2ifwrkuhn2OOCQ-88H6d2vWvONokAhVWj8Je1UHBWkwMhuIwq9bJa_qWgLMW91SR78eT-6J6dl9gNcwgtSnnWanXOAbsy8_5TcsXNPqkHIWX3EJjbRsjAzWmMS36hJ5L7CZE_1-z8PCLTRwzugRp-dAAwHcssbzQ7Mh5bDdhhMKLj4BThDxlv1E4Q4CpS7WBc2cKKCorcGwbM7bjq3rlJFBomKVrgdSiLO68VotpnB0K8OeCiEAN63fLVBvOebLWa7rszk4UEkMjaqeyCzSqpyRht8Pvby0YvYDaGR2gjPmSSvjAN-mke8VMYBZx0FNye6p9Wbel6dxlt1wViSL5UcjCjHfgGnYNfV70N7UMNF8zSUFKek8uWtylygp0N2ElZQHDneYXZnlH_6hwWvZUMa7ofreQR-9O8zIsJOMFb0jqiligqaIAZ4hCkdElBnCal1LWxA").strip()
+    roblox_cookie = os.environ.get("ROBLOX_COOKIE", "").strip()
     if not roblox_cookie:
         return jsonify({"error": "ROBLOX_COOKIE env is not set"}), 500
 
