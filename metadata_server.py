@@ -233,6 +233,191 @@ def upload_decal():
         return jsonify({"error": str(exc)}), 500
 
 
+# ───────────────────────────────────────────────
+# ANIME HUNTER: song title -> full anime info
+# AnimeThemes (song<->anime mapping) enriched with AniList (rich details)
+# ───────────────────────────────────────────────
+ANIMETHEMES_BASE = "https://api.animethemes.moe"
+ANILIST_URL = "https://graphql.anilist.co"
+
+ANILIST_QUERY = """
+query ($id: Int) {
+  Media(id: $id, type: ANIME) {
+    id
+    title { romaji english native }
+    description(asHtml: false)
+    episodes
+    duration
+    format
+    season
+    seasonYear
+    startDate { year }
+    averageScore
+    genres
+    studios(isMain: true) { nodes { name } }
+    coverImage { extraLarge large }
+    siteUrl
+  }
+}
+"""
+
+
+def _anime_pick_image(images):
+    if not images:
+        return ""
+    for facet in ("Large Cover", "Small Cover"):
+        for img in images:
+            if img.get("facet") == facet and img.get("link"):
+                return img["link"]
+    return images[0].get("link", "")
+
+
+def _anime_anilist_id(resources):
+    for res in resources or []:
+        if (res.get("site") or "").lower() == "anilist" and res.get("external_id"):
+            return res.get("external_id"), res.get("link", "")
+    return None, ""
+
+
+def _anime_mal_url(resources):
+    for res in resources or []:
+        if (res.get("site") or "").lower() == "myanimelist":
+            return res.get("link", "")
+    return ""
+
+
+def _anime_strip_html(text):
+    if not text:
+        return ""
+    text = re.sub(r"<br\s*/?>", "\n", text)
+    text = re.sub(r"<[^>]+>", "", text)
+    return text.strip()
+
+
+def _anime_fetch_anilist(anilist_id):
+    try:
+        resp = requests.post(
+            ANILIST_URL,
+            json={"query": ANILIST_QUERY, "variables": {"id": int(anilist_id)}},
+            timeout=20,
+        )
+        if resp.status_code == 200:
+            return (resp.json().get("data") or {}).get("Media")
+    except Exception:
+        pass
+    return None
+
+
+def _build_anime_info(theme):
+    anime = theme.get("anime") or {}
+    song = theme.get("song") or {}
+    artists = song.get("artists") or []
+    artist_names = ", ".join(a.get("name", "") for a in artists if a.get("name"))
+    theme_type = theme.get("type") or ""
+    seq = theme.get("sequence")
+    theme_slug = theme.get("slug") or (f"{theme_type}{seq}" if seq else theme_type)
+
+    resources = anime.get("resources") or []
+    anilist_id, anilist_url = _anime_anilist_id(resources)
+    mal_url = _anime_mal_url(resources)
+
+    info = {
+        "anime_title": anime.get("name", ""),
+        "anime_title_english": "",
+        "anime_title_native": "",
+        "anime_slug": anime.get("slug", ""),
+        "song_title": song.get("title", ""),
+        "song_artists": artist_names,
+        "theme_type": theme_slug,
+        "year": anime.get("year"),
+        "season": anime.get("season", ""),
+        "format": anime.get("media_format", ""),
+        "episodes": None,
+        "duration": None,
+        "genres": [],
+        "studios": [],
+        "score": None,
+        "synopsis": _anime_strip_html(anime.get("synopsis", "")),
+        "cover_url": _anime_pick_image(anime.get("images")),
+        "anilist_url": anilist_url,
+        "mal_url": mal_url,
+        "animethemes_url": f"https://animethemes.moe/anime/{anime.get('slug', '')}",
+    }
+
+    if anilist_id:
+        media = _anime_fetch_anilist(anilist_id)
+        if media:
+            titles = media.get("title") or {}
+            info["anime_title"] = titles.get("romaji") or info["anime_title"]
+            info["anime_title_english"] = titles.get("english") or ""
+            info["anime_title_native"] = titles.get("native") or ""
+            info["episodes"] = media.get("episodes")
+            info["duration"] = media.get("duration")
+            info["format"] = media.get("format") or info["format"]
+            season_val = media.get("season")
+            if isinstance(season_val, str) and season_val:
+                info["season"] = season_val.title()
+            info["year"] = media.get("seasonYear") or (media.get("startDate") or {}).get("year") or info["year"]
+            info["score"] = media.get("averageScore")
+            info["genres"] = media.get("genres") or []
+            info["studios"] = [n.get("name") for n in ((media.get("studios") or {}).get("nodes") or []) if n.get("name")]
+            if not info["synopsis"]:
+                info["synopsis"] = _anime_strip_html(media.get("description", ""))
+            info["anilist_url"] = media.get("siteUrl") or info["anilist_url"]
+            cover = media.get("coverImage") or {}
+            info["cover_url"] = cover.get("extraLarge") or cover.get("large") or info["cover_url"]
+
+    parts = [p for p in [info["anime_title"], info["anime_title_english"]] if p]
+    if len(parts) == 2 and parts[0].lower() != parts[1].lower():
+        info["anime_title_combined"] = f"{parts[0]} ({parts[1]})"
+    else:
+        info["anime_title_combined"] = info["anime_title"]
+    return info
+
+
+@app.post("/cari_anime")
+def cari_anime():
+    data = request.get_json(silent=True) or {}
+    query = (data.get("query") or "").strip()
+    if not query:
+        return jsonify({"error": "Search query empty"}), 400
+
+    try:
+        params = {
+            "q": query,
+            "fields[search]": "animethemes",
+            "include[animetheme]": "anime.images,anime.resources,song.artists",
+        }
+        r = requests.get(f"{ANIMETHEMES_BASE}/search", params=params, timeout=20)
+        if r.status_code != 200:
+            return jsonify({"error": f"AnimeThemes HTTP {r.status_code}"}), 502
+
+        themes = ((r.json() or {}).get("search") or {}).get("animethemes") or []
+        if not themes:
+            return jsonify({"error": "Anime not found for this song"}), 404
+
+        themes = themes[:6]
+        best = _build_anime_info(themes[0])
+
+        candidates = []
+        for t in themes[1:]:
+            a = t.get("anime") or {}
+            s = t.get("song") or {}
+            candidates.append({
+                "anime_title": a.get("name", ""),
+                "song_title": s.get("title", ""),
+                "theme_type": t.get("slug") or t.get("type", ""),
+                "year": a.get("year"),
+                "anime_slug": a.get("slug", ""),
+            })
+
+        best["candidates"] = candidates
+        return jsonify(best)
+
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "5000"))
     app.run(host="0.0.0.0", port=port)
