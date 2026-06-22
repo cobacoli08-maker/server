@@ -347,6 +347,44 @@ def _anisongdb_search(query):
         "character": True,
         "anime_search_filter": {"search": query, "partial_match": True},
         "song_name_search_filter": {"search": query, "partial_match": True},
+        "artist_search_filter": {"search": query, "partial_match": True},
+    }
+    try:
+        r = requests.post(
+            f"{ANISONGDB_BASE}/search_request",
+            json=body,
+            headers={"Accept": "application/json", "Content-Type": "application/json"},
+            timeout=25,
+        )
+        if r.status_code != 200:
+            return [], f"HTTP {r.status_code}: {r.text[:200]}"
+        data = r.json()
+        if isinstance(data, list):
+            return data, ""
+        return [], "unexpected response shape"
+    except Exception as exc:
+        return [], str(exc)
+
+
+def _anisongdb_search_pair(artist_part, song_part):
+    """Intersection search: artist contains artist_part AND song contains song_part.
+    Used when the user types "artist + song" (e.g. "sakura tange arigatou"),
+    which no single AnisongDB field contains as a whole."""
+    body = {
+        "and_logic": True,
+        "ignore_duplicate": False,
+        "opening_filter": True,
+        "ending_filter": True,
+        "insert_filter": True,
+        "normal_broadcast": True,
+        "dub": True,
+        "rebroadcast": True,
+        "standard": True,
+        "instrumental": True,
+        "chanting": True,
+        "character": True,
+        "artist_search_filter": {"search": artist_part, "partial_match": True},
+        "song_name_search_filter": {"search": song_part, "partial_match": True},
     }
     try:
         r = requests.post(
@@ -373,6 +411,9 @@ def _anisong_targets(item):
     ]
     for alt in (item.get("animeAltName") or []):
         targets.append(alt)
+    art = _anisong_artists(item)
+    if art:
+        targets.append(art)
     return targets
 
 
@@ -604,20 +645,33 @@ def cari_anime():
     if not query:
         return jsonify({"error": "Search query empty"}), 400
 
-    queries = [query]
+    # Detect an explicit "A - B" separator (e.g. "artist - song" or "song - artist").
+    dash_parts = None
+    halves = re.split(r"\s+-\s+", query, maxsplit=1)
+    if len(halves) == 2 and halves[0].strip() and halves[1].strip():
+        dash_parts = (halves[0].strip(), halves[1].strip())
+
     romaji_q = _anime_romaji_query(query)
-    if romaji_q:
-        queries.append(romaji_q)
+
+    # Strings used for fuzzy scoring (original + romaji of each meaningful part).
+    queries = []
+    for t in (list(dash_parts) if dash_parts else [query]):
+        if t and t not in queries:
+            queries.append(t)
+        rq = _anime_romaji_query(t)
+        if rq and rq not in queries:
+            queries.append(rq)
 
     try:
         results = []
         seen = set()
         last_err = ""
-        for q in queries:
-            items, err = _anisongdb_search(q)
+
+        def _collect(found, err):
+            nonlocal last_err
             if err:
                 last_err = err
-            for it in items:
+            for it in found:
                 key = it.get("annSongId")
                 if key is None:
                     key = id(it)
@@ -625,6 +679,40 @@ def cari_anime():
                     continue
                 seen.add(key)
                 results.append(it)
+
+        if dash_parts:
+            left, right = dash_parts
+            # Try both orientations so order ("artist - song" or "song - artist")
+            # doesn't matter, plus romaji variants of each side.
+            variants = []
+            for a, b in ((left, right), (right, left)):
+                variants.append((a, b))
+                ra, rb = _anime_romaji_query(a), _anime_romaji_query(b)
+                if ra and rb and (ra, rb) not in variants:
+                    variants.append((ra, rb))
+            for a, b in variants:
+                _collect(*_anisongdb_search_pair(a, b))
+            # If the dash pairing found nothing, fall back to a plain search of each side.
+            if not results:
+                for t in queries:
+                    _collect(*_anisongdb_search(t))
+        else:
+            for q in queries:
+                _collect(*_anisongdb_search(q))
+            # Fallback: user typed "artist song" without a dash. Split the words
+            # and try each boundary as an artist/song intersection search.
+            if not results:
+                for q in queries:
+                    tokens = q.split()
+                    if len(tokens) < 2 or len(tokens) > 5:
+                        continue
+                    for i in range(1, len(tokens)):
+                        l = " ".join(tokens[:i])
+                        r = " ".join(tokens[i:])
+                        _collect(*_anisongdb_search_pair(l, r))
+                        _collect(*_anisongdb_search_pair(r, l))
+                    if results:
+                        break
 
         if not results:
             if last_err:
