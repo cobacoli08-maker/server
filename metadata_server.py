@@ -7,6 +7,7 @@ import json
 import time
 import requests
 import re
+import difflib
 
 app = Flask(__name__)
 CORS(app)
@@ -245,6 +246,7 @@ query ($id: Int) {
   Media(id: $id, type: ANIME) {
     id
     title { romaji english native }
+    synonyms
     description(asHtml: false)
     episodes
     duration
@@ -260,6 +262,87 @@ query ($id: Int) {
   }
 }
 """
+
+
+ANIMETHEMES_HEADERS = {"User-Agent": "karaoke-metadata/1.0"}
+
+
+def _anime_norm(text):
+    if not text:
+        return ""
+    return re.sub(r"[^0-9a-z\u3040-\u30ff\u4e00-\u9fff]", "", text.lower())
+
+
+def _anime_romaji_query(query):
+    try:
+        rq = text_to_romaji_spaced(query)
+        if rq and _anime_norm(rq) != _anime_norm(query):
+            return rq
+    except Exception:
+        pass
+    return ""
+
+
+def _anime_str_score(a, b):
+    a, b = _anime_norm(a), _anime_norm(b)
+    if not a or not b:
+        return 0.0
+    if a == b:
+        return 1.0
+    if a in b or b in a:
+        return 0.80 + 0.15 * (min(len(a), len(b)) / max(len(a), len(b)))
+    return difflib.SequenceMatcher(None, a, b).ratio() * 0.75
+
+
+def _anime_theme_score(theme, queries):
+    anime = theme.get("anime") or {}
+    song = theme.get("song") or {}
+    targets = [song.get("title", ""), anime.get("name", "")]
+    best = 0.0
+    for q in queries:
+        for t in targets:
+            score = _anime_str_score(q, t)
+            if score > best:
+                best = score
+    return best
+
+
+def _animethemes_search(query):
+    params = {
+        "q": query,
+        "fields[search]": "animethemes",
+        "include[animetheme]": "anime,song,song.artists",
+    }
+    try:
+        r = requests.get(
+            f"{ANIMETHEMES_BASE}/search",
+            params=params,
+            headers=ANIMETHEMES_HEADERS,
+            timeout=20,
+        )
+        if r.status_code != 200:
+            return [], f"HTTP {r.status_code}: {r.text[:200]}"
+        themes = ((r.json() or {}).get("search") or {}).get("animethemes") or []
+        return themes, ""
+    except Exception as exc:
+        return [], str(exc)
+
+
+def _anime_fetch_detail(slug):
+    if not slug:
+        return {}
+    try:
+        resp = requests.get(
+            f"{ANIMETHEMES_BASE}/anime/{slug}",
+            params={"include": "images,resources"},
+            headers=ANIMETHEMES_HEADERS,
+            timeout=20,
+        )
+        if resp.status_code == 200:
+            return (resp.json() or {}).get("anime") or {}
+    except Exception:
+        pass
+    return {}
 
 
 def _anime_pick_image(images):
@@ -317,7 +400,9 @@ def _build_anime_info(theme):
     seq = theme.get("sequence")
     theme_slug = theme.get("slug") or (f"{theme_type}{seq}" if seq else theme_type)
 
-    resources = anime.get("resources") or []
+    detail = _anime_fetch_detail(anime.get("slug"))
+    images = detail.get("images") or anime.get("images") or []
+    resources = detail.get("resources") or anime.get("resources") or []
     anilist_id, anilist_url = _anime_anilist_id(resources)
     mal_url = _anime_mal_url(resources)
 
@@ -325,6 +410,7 @@ def _build_anime_info(theme):
         "anime_title": anime.get("name", ""),
         "anime_title_english": "",
         "anime_title_native": "",
+        "synonyms": [],
         "anime_slug": anime.get("slug", ""),
         "song_title": song.get("title", ""),
         "song_artists": artist_names,
@@ -337,8 +423,8 @@ def _build_anime_info(theme):
         "genres": [],
         "studios": [],
         "score": None,
-        "synopsis": _anime_strip_html(anime.get("synopsis", "")),
-        "cover_url": _anime_pick_image(anime.get("images")),
+        "synopsis": _anime_strip_html(detail.get("synopsis") or anime.get("synopsis", "")),
+        "cover_url": _anime_pick_image(images),
         "anilist_url": anilist_url,
         "mal_url": mal_url,
         "animethemes_url": f"https://animethemes.moe/anime/{anime.get('slug', '')}",
@@ -351,6 +437,7 @@ def _build_anime_info(theme):
             info["anime_title"] = titles.get("romaji") or info["anime_title"]
             info["anime_title_english"] = titles.get("english") or ""
             info["anime_title_native"] = titles.get("native") or ""
+            info["synonyms"] = media.get("synonyms") or []
             info["episodes"] = media.get("episodes")
             info["duration"] = media.get("duration")
             info["format"] = media.get("format") or info["format"]
@@ -382,25 +469,46 @@ def cari_anime():
     if not query:
         return jsonify({"error": "Search query empty"}), 400
 
-    try:
-        params = {
-            "q": query,
-            "fields[search]": "animethemes",
-            "include[animetheme]": "anime.images,anime.resources,song.artists",
-        }
-        r = requests.get(f"{ANIMETHEMES_BASE}/search", params=params, timeout=20)
-        if r.status_code != 200:
-            return jsonify({"error": f"AnimeThemes HTTP {r.status_code}"}), 502
+    queries = [query]
+    romaji_q = _anime_romaji_query(query)
+    if romaji_q:
+        queries.append(romaji_q)
 
-        themes = ((r.json() or {}).get("search") or {}).get("animethemes") or []
-        if not themes:
+    try:
+        all_themes = []
+        seen = set()
+        last_err = ""
+        for q in queries:
+            themes, err = _animethemes_search(q)
+            if err:
+                last_err = err
+            for t in themes:
+                key = t.get("id")
+                if key is None:
+                    key = id(t)
+                if key in seen:
+                    continue
+                seen.add(key)
+                all_themes.append(t)
+
+        if not all_themes:
+            if last_err:
+                return jsonify({"error": "AnimeThemes request failed", "detail": last_err}), 502
             return jsonify({"error": "Anime not found for this song"}), 404
 
-        themes = themes[:6]
-        best = _build_anime_info(themes[0])
+        # Rank every candidate by fuzzy similarity to the query (kanji + romaji)
+        ranked = sorted(
+            all_themes,
+            key=lambda t: _anime_theme_score(t, queries),
+            reverse=True,
+        )
+
+        best = _build_anime_info(ranked[0])
+        best["match_score"] = round(_anime_theme_score(ranked[0], queries), 3)
+        best["query_romaji"] = romaji_q
 
         candidates = []
-        for t in themes[1:]:
+        for t in ranked[1:7]:
             a = t.get("anime") or {}
             s = t.get("song") or {}
             candidates.append({
@@ -409,6 +517,7 @@ def cari_anime():
                 "theme_type": t.get("slug") or t.get("type", ""),
                 "year": a.get("year"),
                 "anime_slug": a.get("slug", ""),
+                "score": round(_anime_theme_score(t, queries), 3),
             })
 
         best["candidates"] = candidates
