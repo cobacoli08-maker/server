@@ -328,6 +328,141 @@ def _animethemes_search(query):
         return [], str(exc)
 
 
+ANISONGDB_BASE = "https://anisongdb.com/api"
+
+
+def _anisongdb_search(query):
+    body = {
+        "and_logic": False,
+        "ignore_duplicate": False,
+        "opening_filter": True,
+        "ending_filter": True,
+        "insert_filter": True,
+        "normal_broadcast": True,
+        "dub": True,
+        "rebroadcast": True,
+        "standard": True,
+        "instrumental": True,
+        "chanting": True,
+        "character": True,
+        "anime_search_filter": {"search": query, "partial_match": True},
+        "song_name_search_filter": {"search": query, "partial_match": True},
+    }
+    try:
+        r = requests.post(
+            f"{ANISONGDB_BASE}/search_request",
+            json=body,
+            headers={"Accept": "application/json", "Content-Type": "application/json"},
+            timeout=25,
+        )
+        if r.status_code != 200:
+            return [], f"HTTP {r.status_code}: {r.text[:200]}"
+        data = r.json()
+        if isinstance(data, list):
+            return data, ""
+        return [], "unexpected response shape"
+    except Exception as exc:
+        return [], str(exc)
+
+
+def _anisong_targets(item):
+    targets = [
+        item.get("songName", ""),
+        item.get("animeENName", ""),
+        item.get("animeJPName", ""),
+    ]
+    for alt in (item.get("animeAltName") or []):
+        targets.append(alt)
+    return targets
+
+
+def _anisong_score(item, queries):
+    best = 0.0
+    for q in queries:
+        for t in _anisong_targets(item):
+            s = _anime_str_score(q, t)
+            if s > best:
+                best = s
+    return best
+
+
+def _anisong_type_short(song_type):
+    st = (song_type or "").strip()
+    low = st.lower()
+    if low.startswith("opening"):
+        return ("OP" + st[len("opening"):].strip()).strip()
+    if low.startswith("ending"):
+        return ("ED" + st[len("ending"):].strip()).strip()
+    return st
+
+
+def _anisong_artists(item):
+    if item.get("songArtist"):
+        return item.get("songArtist")
+    names = []
+    for a in (item.get("artists") or []):
+        nm = a.get("names") or []
+        if nm:
+            names.append(nm[0])
+    return ", ".join(names)
+
+
+def _anilist_media_by_id(anilist_id):
+    if not anilist_id:
+        return {}
+    try:
+        r = requests.post(
+            ANILIST_URL,
+            json={"query": ANILIST_QUERY, "variables": {"id": int(anilist_id)}},
+            timeout=20,
+        )
+        if r.status_code != 200:
+            return {}
+        return ((r.json() or {}).get("data") or {}).get("Media") or {}
+    except Exception:
+        return {}
+
+
+def _build_anime_from_anisong(item):
+    linked = item.get("linked_ids") or {}
+    anilist_id = linked.get("anilist")
+    mal_id = linked.get("myanimelist")
+
+    info = {
+        "anime_title": item.get("animeENName", "") or item.get("animeJPName", ""),
+        "anime_title_english": "",
+        "anime_title_native": item.get("animeJPName", ""),
+        "synonyms": item.get("animeAltName") or [],
+        "song_title": item.get("songName", ""),
+        "song_artists": _anisong_artists(item),
+        "theme_type": _anisong_type_short(item.get("songType", "")),
+        "song_type_full": item.get("songType", ""),
+        "episodes": None,
+        "cover_url": "",
+        "anilist_url": (f"https://anilist.co/anime/{anilist_id}" if anilist_id else ""),
+        "mal_url": (f"https://myanimelist.net/anime/{mal_id}" if mal_id else ""),
+        "vintage": item.get("animeVintage", ""),
+    }
+
+    media = _anilist_media_by_id(anilist_id)
+    if media:
+        titles = media.get("title") or {}
+        if titles.get("romaji"):
+            info["anime_title"] = titles.get("romaji")
+        info["anime_title_english"] = titles.get("english") or ""
+        if titles.get("native"):
+            info["anime_title_native"] = titles.get("native")
+        if media.get("synonyms"):
+            info["synonyms"] = media.get("synonyms")
+        info["episodes"] = media.get("episodes")
+        cover = media.get("coverImage") or {}
+        info["cover_url"] = cover.get("extraLarge") or cover.get("large") or ""
+        if media.get("siteUrl"):
+            info["anilist_url"] = media.get("siteUrl")
+
+    return info
+
+
 def _anime_fetch_detail(slug):
     if not slug:
         return {}
@@ -475,49 +610,46 @@ def cari_anime():
         queries.append(romaji_q)
 
     try:
-        all_themes = []
+        results = []
         seen = set()
         last_err = ""
         for q in queries:
-            themes, err = _animethemes_search(q)
+            items, err = _anisongdb_search(q)
             if err:
                 last_err = err
-            for t in themes:
-                key = t.get("id")
+            for it in items:
+                key = it.get("annSongId")
                 if key is None:
-                    key = id(t)
+                    key = id(it)
                 if key in seen:
                     continue
                 seen.add(key)
-                all_themes.append(t)
+                results.append(it)
 
-        if not all_themes:
+        if not results:
             if last_err:
-                return jsonify({"error": "AnimeThemes request failed", "detail": last_err}), 502
-            return jsonify({"error": "Anime not found for this song"}), 404
+                return jsonify({"error": "AnisongDB request failed", "detail": last_err}), 502
+            return jsonify({"error": "Song or anime not found"}), 404
 
         # Rank every candidate by fuzzy similarity to the query (kanji + romaji)
         ranked = sorted(
-            all_themes,
-            key=lambda t: _anime_theme_score(t, queries),
+            results,
+            key=lambda it: _anisong_score(it, queries),
             reverse=True,
         )
 
-        best = _build_anime_info(ranked[0])
-        best["match_score"] = round(_anime_theme_score(ranked[0], queries), 3)
+        best = _build_anime_from_anisong(ranked[0])
+        best["match_score"] = round(_anisong_score(ranked[0], queries), 3)
         best["query_romaji"] = romaji_q
 
         candidates = []
-        for t in ranked[1:7]:
-            a = t.get("anime") or {}
-            s = t.get("song") or {}
+        for it in ranked[1:8]:
             candidates.append({
-                "anime_title": a.get("name", ""),
-                "song_title": s.get("title", ""),
-                "theme_type": t.get("slug") or t.get("type", ""),
-                "year": a.get("year"),
-                "anime_slug": a.get("slug", ""),
-                "score": round(_anime_theme_score(t, queries), 3),
+                "anime_title": it.get("animeENName", "") or it.get("animeJPName", ""),
+                "song_title": it.get("songName", ""),
+                "theme_type": _anisong_type_short(it.get("songType", "")),
+                "artist": _anisong_artists(it),
+                "score": round(_anisong_score(it, queries), 3),
             })
 
         best["candidates"] = candidates
