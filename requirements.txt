@@ -1,0 +1,6 @@
+flask
+flask-cors
+ytmusicapi
+pykakasi
+requests
+yt-dlp
