@@ -980,15 +980,15 @@ AI_TIMEOUT_SEC = int(os.environ.get("AI_TIMEOUT_SEC", "25"))
 # Gemini/NVIDIA/OpenRouter are backups if the two fast ones are rate-limited/down.
 AI_PROVIDERS = [
     {"name": "groq",       "base": "https://api.groq.com/openai/v1/chat/completions",
-     "key_env": "GROQ_API_KEY",       "model_env": "GROQ_MODEL",       "default_model": "qwen/qwen3-32b"},
+     "key_envs": ["GROQ_API_KEY"],       "model_env": "GROQ_MODEL",       "default_models": ["qwen3.6-27b"]},
     {"name": "cerebras",   "base": "https://api.cerebras.ai/v1/chat/completions",
-     "key_env": "CEREBRAS_API_KEY",   "model_env": "CEREBRAS_MODEL",   "default_model": "qwen-3-32b"},
+     "key_envs": ["CEREBRAS_API_KEY"],   "model_env": "CEREBRAS_MODEL",   "default_models": ["gpt-oss-120b", "zai-glm-4.7", "gemma-4-31b"]},
     {"name": "gemini",     "base": "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
-     "key_env": "GEMINI_API_KEY",     "model_env": "GEMINI_MODEL",     "default_model": "gemini-2.0-flash"},
+     "key_envs": ["GEMINI_API_KEY", "GOOGLE_API_KEY"],     "model_env": "GEMINI_MODEL",     "default_models": ["gemini-2.0-flash"]},
     {"name": "nvidia",     "base": "https://integrate.api.nvidia.com/v1/chat/completions",
-     "key_env": "NVIDIA_API_KEY",     "model_env": "NVIDIA_MODEL",     "default_model": "qwen/qwen2.5-coder-32b-instruct"},
+     "key_envs": ["NVIDIA_API_KEY"],     "model_env": "NVIDIA_MODEL",     "default_models": ["qwen/qwen2.5-coder-32b-instruct"]},
     {"name": "openrouter", "base": "https://openrouter.ai/api/v1/chat/completions",
-     "key_env": "OPENROUTER_API_KEY", "model_env": "OPENROUTER_MODEL", "default_model": "google/gemini-2.0-flash-exp:free"},
+     "key_envs": ["OPENROUTER_API_KEY"], "model_env": "OPENROUTER_MODEL", "default_models": ["google/gemini-2.0-flash-exp:free"]},
 ]
 
 _AI_THINK_RE = re.compile(r"<think>.*?</think>\s*", re.DOTALL | re.IGNORECASE)
@@ -1018,45 +1018,52 @@ def ai_generate():
 
     errors = []
     tried = 0
+    req_max_tokens = int(data.get("max_tokens") or os.environ.get("AI_MAX_TOKENS") or 4096)
     for p in AI_PROVIDERS:
-        key = (os.environ.get(p["key_env"]) or "").strip()
+        key = ""
+        for env_name in p["key_envs"]:
+            key = (os.environ.get(env_name) or "").strip()
+            if key:
+                break
         if not key:
             continue
-        tried += 1
-        model = (os.environ.get(p["model_env"]) or "").strip() or p["default_model"]
-        sys_p = system_prompt
-        extra = {}
-        is_thinking = any(t in model.lower() for t in ("qwen", "glm", "gpt-oss"))
-        if is_thinking:
-            sys_p = (system_prompt or "") + "\n\n/no_think\nIMPORTANT: Output ONLY the final answer. No reasoning, no <think> tags."
-            if p["name"] == "groq" and "qwen" in model.lower():
-                extra["reasoning_effort"] = "none"
-        try:
-            body = {
-                "model": model,
-                "temperature": temperature,
-                "max_tokens": int(data.get("max_tokens") or 8192),
-                "messages": [
-                    {"role": "system", "content": sys_p},
-                    {"role": "user", "content": user_prompt},
-                ],
-            }
-            body.update(extra)
-            r = requests.post(
-                p["base"],
-                headers={"Content-Type": "application/json", "Authorization": "Bearer " + key},
-                json=body,
-                timeout=AI_TIMEOUT_SEC,
-            )
-            if r.status_code != 200:
-                errors.append("%s[%s] HTTP %s: %s" % (p["name"], model, r.status_code, r.text[:150]))
-                continue
-            content = _clean_ai_output(r.json()["choices"][0]["message"]["content"])
-            if content:
-                return jsonify({"content": content, "provider": p["name"], "model": model})
-            errors.append("%s[%s]: empty/reasoning-only" % (p["name"], model))
-        except Exception as exc:
-            errors.append("%s[%s]: %s: %s" % (p["name"], model, type(exc).__name__, exc))
+        env_models = (os.environ.get(p["model_env"]) or "").strip()
+        models = [m.strip() for m in (env_models.split(",") if env_models else list(p["default_models"])) if m.strip()]
+        for model in models:
+            tried += 1
+            sys_p = system_prompt
+            extra = {}
+            is_thinking = any(t in model.lower() for t in ("qwen", "glm", "gpt-oss", "deepseek", "-r1"))
+            if is_thinking:
+                sys_p = (system_prompt or "") + "\n\n/no_think\nIMPORTANT: Output ONLY the final answer. No reasoning, no <think> tags."
+                if p["name"] == "groq" and "qwen" in model.lower():
+                    extra["reasoning_effort"] = "none"
+            try:
+                body = {
+                    "model": model,
+                    "temperature": temperature,
+                    "max_tokens": req_max_tokens,
+                    "messages": [
+                        {"role": "system", "content": sys_p},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                }
+                body.update(extra)
+                r = requests.post(
+                    p["base"],
+                    headers={"Content-Type": "application/json", "Authorization": "Bearer " + key},
+                    json=body,
+                    timeout=AI_TIMEOUT_SEC,
+                )
+                if r.status_code != 200:
+                    errors.append("%s[%s] HTTP %s: %s" % (p["name"], model, r.status_code, r.text[:150]))
+                    continue
+                content = _clean_ai_output(r.json()["choices"][0]["message"]["content"])
+                if content:
+                    return jsonify({"content": content, "provider": p["name"], "model": model})
+                errors.append("%s[%s]: empty/reasoning-only" % (p["name"], model))
+            except Exception as exc:
+                errors.append("%s[%s]: %s: %s" % (p["name"], model, type(exc).__name__, exc))
 
     if tried == 0:
         return jsonify({"error": "AI Auto is not active yet: no provider key set in the server ENV. "
