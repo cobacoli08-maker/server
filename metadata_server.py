@@ -4,10 +4,35 @@ from ytmusicapi import YTMusic
 import pykakasi
 import os
 import json
+import base64
 import time
 import requests
 import re
 import difflib
+
+# ── .env loader (for LOCAL TESTING) ─────────────────────────────────────
+# Kalau ada file `.env` sefolder, baca KEY=VALUE ke os.environ.
+# Existing env (e.g. Railway Variables) is NOT overwritten -> production keeps using Railway.
+def _load_dotenv():
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    if not os.path.exists(path):
+        return
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, val = line.partition("=")
+                key = key.strip()
+                val = val.strip().strip('"').strip("'")
+                if key and key not in os.environ:
+                    os.environ[key] = val
+        print("\u2705 .env loaded (test lokal)")
+    except Exception as e:
+        print("\u26a0\ufe0f  failed to read .env:", e)
+
+_load_dotenv()
 
 app = Flask(__name__)
 CORS(app)
@@ -60,8 +85,8 @@ def health():
 @app.get("/version")
 def version():
     return jsonify({
-        "version": "2026-06-06-0708",
-        "features": ["romaji_particle_split", "upload_decal"],
+        "version": "2026-07-13-mod",
+        "features": ["romaji_particle_split", "upload_decal", "custom_image_decal", "yt_lyrics"],
     })
 
 
@@ -167,16 +192,29 @@ def upload_decal():
 
     data = request.get_json(silent=True) or {}
     image_url = (data.get("image_url") or "").strip()
+    image_b64 = (data.get("image_base64") or "").strip()
     decal_name = (data.get("name") or "Karaoke Cover").strip()[:40]
-    if not image_url:
-        return jsonify({"error": "image_url required"}), 400
+    if not image_url and not image_b64:
+        return jsonify({"error": "image_url or image_base64 required"}), 400
 
     try:
-        img_resp = requests.get(image_url, timeout=20)
-        if img_resp.status_code != 200:
-            return jsonify({"error": f"Failed to download image: HTTP {img_resp.status_code}"}), 400
+        if image_b64:
+            if image_b64.startswith("data:") and "," in image_b64:
+                image_b64 = image_b64.split(",", 1)[1]
+            try:
+                img_bytes = base64.b64decode(image_b64)
+            except Exception as dec_exc:
+                return jsonify({"error": f"Invalid image_base64: {dec_exc}"}), 400
+            content_type = (data.get("content_type") or "image/png").split(";")[0]
+            file_name = (data.get("filename") or "cover.png")
+        else:
+            img_resp = requests.get(image_url, timeout=20)
+            if img_resp.status_code != 200:
+                return jsonify({"error": f"Failed to download image: HTTP {img_resp.status_code}"}), 400
+            content_type = img_resp.headers.get("Content-Type", "image/png").split(";")[0]
+            img_bytes = img_resp.content
+            file_name = "cover.png"
 
-        content_type = img_resp.headers.get("Content-Type", "image/png").split(";")[0]
         session = requests.Session()
         session.cookies[".ROBLOSECURITY"] = roblox_cookie
 
@@ -198,7 +236,7 @@ def upload_decal():
         }
         files = {
             "request": ("", json.dumps(req_payload), "application/json"),
-            "fileContent": ("cover.png", img_resp.content, content_type),
+            "fileContent": (file_name, img_bytes, content_type),
         }
         up_resp = session.post(
             "https://apis.roblox.com/assets/user-auth/v1/assets",
@@ -230,6 +268,190 @@ def upload_decal():
 
         return jsonify({"error": "Timeout waiting for Roblox asset processing"}), 504
 
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
+
+# ───────────────────────────────────────────────
+# YT LYRIC SYNC: YouTube Music lyrics -> enhanced (per-token timed) REXT
+# YT-only. Line-level YT timings are expanded to per-token estimates.
+# ───────────────────────────────────────────────
+MORA_PACE = 0.34
+READING_OVERRIDES = {"君": "きみ", "日": "ひ", "傍": "そば", "何処": "どこ", "何時": "いつ"}
+_SMALL_KANA = set("ぁぃぅぇぉゃゅょゎァィゥェォャュョヮ")
+
+
+def _mora_count(reading):
+    if not reading:
+        return 0
+    n = 0
+    for ch in reading:
+        if ch in _SMALL_KANA:
+            continue
+        n += 1
+    return max(1, n)
+
+
+def _mora_count_text(text):
+    total = 0
+    try:
+        for it in kks.convert(text or ""):
+            total += _mora_count(it.get("hira") or it.get("kana") or "")
+    except Exception:
+        total = len(text or "")
+    return max(1, total)
+
+
+def _fmt_time(sec):
+    if sec is None or sec < 0:
+        sec = 0
+    m = int(sec // 60)
+    s = sec - m * 60
+    return f"{m:02d}:{s:05.2f}"
+
+
+def _has_kanji(s):
+    return any("\u4e00" <= ch <= "\u9fff" for ch in (s or ""))
+
+
+def _reading_of(orig, hira):
+    if orig in READING_OVERRIDES:
+        return READING_OVERRIDES[orig]
+    return hira or ""
+
+
+def _enhanced_line(text, start, end, track=1):
+    text = (text or "").strip()
+    if not text:
+        return None
+    segs = []
+    try:
+        for it in kks.convert(text):
+            orig = it.get("orig") or ""
+            hira = it.get("hira") or it.get("kana") or ""
+            if not orig.strip():
+                segs.append({"text": orig, "ruby": "", "w": 0})
+                continue
+            reading = _reading_of(orig, hira)
+            w = _mora_count(reading) if reading else max(1, len(orig))
+            ruby = reading if (_has_kanji(orig) and reading and reading != orig) else ""
+            segs.append({"text": orig, "ruby": ruby, "w": w})
+    except Exception:
+        segs = [{"text": text, "ruby": "", "w": max(1, len(text))}]
+    total_w = sum(s["w"] for s in segs) or 1
+    if end and end > start:
+        span = end - start
+    else:
+        span = total_w * MORA_PACE
+    span = max(0.05, span)
+    natural = total_w * MORA_PACE
+    eff = min(span, natural) if natural > 0 else span
+    out = f"[{_fmt_time(start)}][T:{track}]"
+    cum = 0
+    for s in segs:
+        ts = start + (cum / total_w) * eff
+        cum += s["w"]
+        out += f"<{_fmt_time(ts)}>{s['text']}"
+        if s["ruby"]:
+            out += f"[{s['ruby']}]"
+    out += " /"
+    return out
+
+
+def _yt_lyric_lines(raw):
+    parsed = []
+    for ll in raw:
+        if isinstance(ll, dict):
+            txt = ll.get("text") or ""
+            st = ll.get("start_time")
+            en = ll.get("end_time")
+        else:
+            txt = getattr(ll, "text", "") or ""
+            st = getattr(ll, "start_time", None)
+            en = getattr(ll, "end_time", None)
+        if st is not None and st > 1000:
+            st = st / 1000.0
+        if en is not None and en > 1000:
+            en = en / 1000.0
+        parsed.append({"text": txt, "st": st, "en": en})
+    return parsed
+
+
+@app.post("/yt_lyrics")
+def yt_lyrics():
+    data = request.get_json(silent=True) or {}
+    query = (data.get("query") or "").strip()
+    video_id = (data.get("videoId") or data.get("video_id") or "").strip()
+    if not query and not video_id:
+        return jsonify({"error": "query or videoId required"}), 400
+    try:
+        yt = ytmusic_ja
+        if not video_id:
+            results = yt.search(query, filter="songs") or []
+            if not results:
+                results = yt.search(query) or []
+            for r in results:
+                if isinstance(r, dict) and r.get("videoId"):
+                    video_id = r["videoId"]
+                    break
+            if not video_id:
+                return jsonify({"error": "No YouTube Music result for query"}), 404
+        watch = yt.get_watch_playlist(videoId=video_id)
+        lyrics_browse = watch.get("lyrics") if isinstance(watch, dict) else None
+        if not lyrics_browse:
+            return jsonify({"error": "No lyrics available for this song on YT Music", "videoId": video_id}), 404
+        timed_supported = True
+        try:
+            lyr = yt.get_lyrics(lyrics_browse, timestamps=True)
+        except TypeError:
+            lyr = yt.get_lyrics(lyrics_browse)
+            timed_supported = False
+        lyric_data = lyr.get("lyrics") if isinstance(lyr, dict) else None
+        source = (lyr.get("source") if isinstance(lyr, dict) else "") or ""
+        rext_lines = []
+        has_time = False
+        if isinstance(lyric_data, list):
+            parsed = _yt_lyric_lines(lyric_data)
+            for i, p in enumerate(parsed):
+                txt = (p["text"] or "").strip()
+                if not txt:
+                    continue
+                if p["st"] is None:
+                    continue
+                has_time = True
+                st = float(p["st"])
+                en = p["en"]
+                if en is None:
+                    nxt = None
+                    for j in range(i + 1, len(parsed)):
+                        if parsed[j]["st"] is not None:
+                            nxt = float(parsed[j]["st"])
+                            break
+                    en = nxt if nxt is not None else st + max(1.0, _mora_count_text(txt) * MORA_PACE)
+                line = _enhanced_line(txt, st, float(en))
+                if line:
+                    rext_lines.append(line)
+        elif isinstance(lyric_data, str):
+            t = 0.0
+            for raw in lyric_data.split("\n"):
+                raw = raw.strip()
+                if not raw:
+                    t += 0.6
+                    continue
+                dur = max(1.0, _mora_count_text(raw) * MORA_PACE)
+                line = _enhanced_line(raw, t, t + dur)
+                if line:
+                    rext_lines.append(line)
+                t += dur + 0.25
+        if not rext_lines:
+            return jsonify({"error": "Lyrics found but could not be parsed into synced lines", "videoId": video_id}), 422
+        return jsonify({
+            "rext": "\n".join(rext_lines),
+            "timed": bool(has_time and timed_supported),
+            "line_count": len(rext_lines),
+            "videoId": video_id,
+            "source": source,
+        })
     except Exception as exc:
         return jsonify({"error": str(exc)}), 500
 
@@ -745,6 +967,113 @@ def cari_anime():
 
     except Exception as exc:
         return jsonify({"error": str(exc)}), 500
+
+
+# ── AI auto-pool: stateless multi-provider fallback ("OmniRoute-lite") ──
+# Replaces the stateful OmniRoute hosting. ALL config via ENV, so:
+#   host mati -> host baru -> paste ENV yg sama -> langsung jalan lagi.
+# Tiap provider OpenAI-compatible /chat/completions. Provider di-SKIP kalau
+# its ENV key is empty. Tried in order (top = priority); first success wins.
+AI_TIMEOUT_SEC = int(os.environ.get("AI_TIMEOUT_SEC", "25"))
+
+# Order = priority. Groq & Cerebras at the TOP because they are the fastest for AI Space.
+# Gemini/NVIDIA/OpenRouter are backups if the two fast ones are rate-limited/down.
+AI_PROVIDERS = [
+    {"name": "groq",       "base": "https://api.groq.com/openai/v1/chat/completions",
+     "key_env": "GROQ_API_KEY",       "model_env": "GROQ_MODEL",       "default_model": "qwen/qwen3-32b"},
+    {"name": "cerebras",   "base": "https://api.cerebras.ai/v1/chat/completions",
+     "key_env": "CEREBRAS_API_KEY",   "model_env": "CEREBRAS_MODEL",   "default_model": "qwen-3-32b"},
+    {"name": "gemini",     "base": "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+     "key_env": "GEMINI_API_KEY",     "model_env": "GEMINI_MODEL",     "default_model": "gemini-2.0-flash"},
+    {"name": "nvidia",     "base": "https://integrate.api.nvidia.com/v1/chat/completions",
+     "key_env": "NVIDIA_API_KEY",     "model_env": "NVIDIA_MODEL",     "default_model": "qwen/qwen2.5-coder-32b-instruct"},
+    {"name": "openrouter", "base": "https://openrouter.ai/api/v1/chat/completions",
+     "key_env": "OPENROUTER_API_KEY", "model_env": "OPENROUTER_MODEL", "default_model": "google/gemini-2.0-flash-exp:free"},
+]
+
+_AI_THINK_RE = re.compile(r"<think>.*?</think>\s*", re.DOTALL | re.IGNORECASE)
+
+
+def _clean_ai_output(text):
+    """Buang blok reasoning <think>...</think> dari model thinking (qwen/glm)."""
+    if not text:
+        return text
+    text = _AI_THINK_RE.sub("", text)
+    if "</think>" in text:
+        text = text.rsplit("</think>", 1)[-1]
+    if "<think>" in text.lower():
+        return ""  # reasoning truncated -> treat as failure, roll to next provider
+    return text.strip()
+
+
+@app.route("/ai", methods=["POST"])
+def ai_generate():
+    """AI Auto pool. Body: {system, user, temperature?, max_tokens?}. Returns {content, provider, model}."""
+    data = request.get_json(silent=True) or {}
+    system_prompt = data.get("system") or data.get("systemPrompt") or ""
+    user_prompt = data.get("user") or data.get("userPrompt") or ""
+    temperature = data.get("temperature", 0.1)
+    if not user_prompt:
+        return jsonify({"error": "user prompt is empty"}), 400
+
+    errors = []
+    tried = 0
+    for p in AI_PROVIDERS:
+        key = (os.environ.get(p["key_env"]) or "").strip()
+        if not key:
+            continue
+        tried += 1
+        model = (os.environ.get(p["model_env"]) or "").strip() or p["default_model"]
+        sys_p = system_prompt
+        extra = {}
+        is_thinking = any(t in model.lower() for t in ("qwen", "glm", "gpt-oss"))
+        if is_thinking:
+            sys_p = (system_prompt or "") + "\n\n/no_think\nIMPORTANT: Output ONLY the final answer. No reasoning, no <think> tags."
+            if p["name"] == "groq" and "qwen" in model.lower():
+                extra["reasoning_effort"] = "none"
+        try:
+            body = {
+                "model": model,
+                "temperature": temperature,
+                "max_tokens": int(data.get("max_tokens") or 4096),
+                "messages": [
+                    {"role": "system", "content": sys_p},
+                    {"role": "user", "content": user_prompt},
+                ],
+            }
+            body.update(extra)
+            r = requests.post(
+                p["base"],
+                headers={"Content-Type": "application/json", "Authorization": "Bearer " + key},
+                json=body,
+                timeout=AI_TIMEOUT_SEC,
+            )
+            if r.status_code != 200:
+                errors.append("%s[%s] HTTP %s: %s" % (p["name"], model, r.status_code, r.text[:150]))
+                continue
+            content = _clean_ai_output(r.json()["choices"][0]["message"]["content"])
+            if content:
+                return jsonify({"content": content, "provider": p["name"], "model": model})
+            errors.append("%s[%s]: empty/reasoning-only" % (p["name"], model))
+        except Exception as exc:
+            errors.append("%s[%s]: %s: %s" % (p["name"], model, type(exc).__name__, exc))
+
+    if tried == 0:
+        return jsonify({"error": "AI Auto is not active yet: no provider key set in the server ENV. "
+                                 "Set at least one of GEMINI_API_KEY / GROQ_API_KEY / CEREBRAS_API_KEY / "
+                                 "NVIDIA_API_KEY / OPENROUTER_API_KEY on Railway."}), 503
+    return jsonify({"error": "All AI providers failed", "detail": errors}), 502
+
+
+# ── YT Lyric Sync add-on (ported 1:1 from the local build) ─────────────
+# Adds /search_songs, /fetch_lyrics, /web_lyrics, /sync_lyrics — the exact
+# working YT timed-lyric + kanji-sync system used by the local editor.
+try:
+    import lyric_sync_addon
+    lyric_sync_addon.register(app, ytmusic_ja)
+    print("✅ lyric_sync_addon registered (/search_songs, /fetch_lyrics, /web_lyrics, /sync_lyrics)")
+except Exception as _e:
+    print("⚠️ lyric_sync_addon not loaded:", _e)
 
 
 if __name__ == "__main__":
