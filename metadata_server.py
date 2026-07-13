@@ -1035,7 +1035,7 @@ def ai_generate():
             body = {
                 "model": model,
                 "temperature": temperature,
-                "max_tokens": int(data.get("max_tokens") or 4096),
+                "max_tokens": int(data.get("max_tokens") or 8192),
                 "messages": [
                     {"role": "system", "content": sys_p},
                     {"role": "user", "content": user_prompt},
