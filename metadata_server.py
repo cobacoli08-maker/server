@@ -986,8 +986,9 @@ AI_TIMEOUT_SEC = int(os.environ.get("AI_TIMEOUT_SEC", "25"))
 AI_PROVIDERS = [
     {"name": "groq",       "base": "https://api.groq.com/openai/v1/chat/completions",
      "key_envs": ["GROQ_API_KEY"],       "model_env": "GROQ_MODEL",       "default_models": ["qwen3.6-27b"]},
-    {"name": "cerebras",   "base": "https://api.cerebras.ai/v1/chat/completions",
-     "key_envs": ["CEREBRAS_API_KEY"],   "model_env": "CEREBRAS_MODEL",   "default_models": ["gpt-oss-120b", "zai-glm-4.7", "gemma-4-31b"]},
+    # --- cerebras DISABLED (bad AI Space output). Re-enable = uncomment these 2 lines. ---
+    # {"name": "cerebras",   "base": "https://api.cerebras.ai/v1/chat/completions",
+    #  "key_envs": ["CEREBRAS_API_KEY"],   "model_env": "CEREBRAS_MODEL",   "default_models": ["gpt-oss-120b", "zai-glm-4.7", "gemma-4-31b"]},
     {"name": "gemini",     "base": "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
      "key_envs": ["GEMINI_API_KEY", "GOOGLE_API_KEY"],     "model_env": "GEMINI_MODEL",     "default_models": ["gemini-2.0-flash"]},
     {"name": "nvidia",     "base": "https://integrate.api.nvidia.com/v1/chat/completions",
