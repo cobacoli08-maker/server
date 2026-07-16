@@ -48,6 +48,18 @@ import json
 import time
 import requests as http_req
 from flask import request, jsonify, send_file, Response
+import collections
+
+# -- debug event log (in-memory ring buffer, exposed via GET /decals/log) --
+_EVENTS = collections.deque(maxlen=400)
+def _log(event, **data):
+    rec = {"ts": int(time.time() * 1000), "event": event}
+    rec.update(data)
+    _EVENTS.append(rec)
+    try:
+        print("[decal_db] " + json.dumps(rec, ensure_ascii=False)[:1500])
+    except Exception:
+        print("[decal_db]", event, data)
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _DIR = (os.environ.get("DECAL_DB_DIR", "").strip() or _HERE)
@@ -134,11 +146,12 @@ def _whoami(s):
     return None, None
 
 
-def _fetch_all_created_decals(s):
-    """Pull all Decals created by the account (paginated) via the creations API."""
+def _fetch_all_created_decals(s, max_pages=200):
+    """Pull all Decals created by the account (paginated) via the creations API.
+    Pass max_pages=1 to fetch only the newest ~50 (fast; used by live refresh)."""
     items = []
     cursor = ""
-    for _ in range(200):  # safety cap
+    for _ in range(max_pages):  # safety cap
         params = {"assetType": "Decal", "isArchived": "false", "limit": 50, "sortOrder": "Desc"}
         if cursor:
             params["cursor"] = cursor
@@ -263,6 +276,9 @@ def register_uploaded_decal(asset_id, name="", cookie=None):
         entry.setdefault("status", "pending")
     db["items"][aid] = entry
     _save_db(db)
+    _log("upload.register", assetId=aid, status=entry.get("status"),
+         state=entry.get("state", ""), hasImage=bool(entry.get("imageUrl")),
+         hasCookie=bool(cookie), name=entry.get("name"))
     print("[decal_db] auto-registered uploaded decal", aid, "->", entry.get("status"))
     return entry
 
@@ -321,6 +337,7 @@ def register(app, roblox_cookie=None):
         if not cookies:
             return jsonify({"error": "ROBLOX_COOKIE is not set."}), 500
         db = _load_db(); items = db["items"]
+        _log("sync.start", cookies=len(cookies), dbCount=len(items))
         added = 0
         accounts = []          # per-account report
         errors = []            # dead/banned/expired cookies etc.
@@ -353,6 +370,8 @@ def register(app, roblox_cookie=None):
         counts = {}
         for v in items.values():
             counts[v.get("status", "?")] = counts.get(v.get("status", "?"), 0) + 1
+        _log("sync.done", total=len(items), newlyAdded=added,
+             accounts=accounts, errors=errors, counts=counts)
         return jsonify({"ok": True, "total": len(items), "newlyAdded": added,
                         "accountsSynced": len(accounts), "accounts": accounts,
                         "errors": errors, "counts": counts})
@@ -380,14 +399,18 @@ def register(app, roblox_cookie=None):
 
     @app.post("/decals/recheck")
     def decals_recheck():
-        """PUBLIC (no admin): re-check thumbnail status for freshly-uploaded /
-        still-processing decals so the gallery updates live on refresh. The
-        browser cannot call Roblox directly (CORS blocks thumbnails.roblox.com),
-        so the check runs here on the server using the account cookie. Only
-        touches unsettled items (pending/error) or explicit ids from the body,
-        and is capped so a refresh stays fast."""
+        """PUBLIC (no admin). Runs on every gallery Refresh. Does two things the
+        browser cannot do (Roblox blocks CORS on thumbnails.roblox.com):
+          1) DISCOVER new decals -> pulls the newest page (~50) of the account's
+             created decals, so a brand-new upload appears on Refresh even if
+             auto-register at upload time failed/timed out. (This is why plain
+             Refresh used to do nothing and only Sync worked: Refresh never
+             discovered new decals.)
+          2) RE-CHECK unsettled items (pending/error) so thumbnails resolve.
+        Everything is logged to GET /decals/log with raw counts / ids / states."""
         cookie = _cookie()
         if not cookie:
+            _log("recheck.no_cookie")
             return jsonify({"error": "ROBLOX_COOKIE is not set."}), 500
 
         def _counts(items):
@@ -398,27 +421,71 @@ def register(app, roblox_cookie=None):
 
         body = request.get_json(silent=True) or {}
         want = [str(x).strip() for x in (body.get("ids") or []) if str(x).strip().isdigit()]
+        _log("recheck.start", wantIds=want)
         try:
             db = _load_db()
+            sess = _session(cookie)
+
+            # 1) discover the newest decals (first page only = fast)
+            discovered = []
+            disc_error = None
+            try:
+                latest = _fetch_all_created_decals(sess, max_pages=1)
+                new_ids = [c["assetId"] for c in latest if c["assetId"] not in db["items"]]
+                if new_ids:
+                    uid, uname = _whoami(sess)
+                    dthumbs = _fetch_thumbnails(sess, new_ids)
+                    dcdates = _fetch_created_dates(sess, new_ids)
+                    for c in latest:
+                        aid = c["assetId"]
+                        if aid in db["items"]:
+                            continue
+                        entry = {"assetId": aid, "name": c["name"],
+                                 "created": dcdates.get(aid) or c["created"] or "",
+                                 "addedAt": int(time.time()),
+                                 "owner": uname or "", "ownerId": uid or ""}
+                        _classify(entry, dthumbs.get(aid))
+                        db["items"][aid] = entry
+                        discovered.append({"assetId": aid, "status": entry.get("status"),
+                                           "state": entry.get("state", "")})
+                _log("recheck.discovered", latestPage=len(latest),
+                     newCount=len(discovered), newItems=discovered)
+            except Exception as de:
+                disc_error = str(de)
+                _log("recheck.discover_error", error=disc_error)
+
+            # 2) re-check unsettled items
             if want:
                 targets = [aid for aid in want if aid in db["items"]]
             else:
                 targets = [aid for aid, v in db["items"].items()
                            if v.get("status") in ("pending", "error", "")]
-            targets = targets[:80]  # keep a page refresh fast
-            if not targets:
-                return jsonify({"ok": True, "rechecked": 0, "resolved": 0,
-                                "total": len(db["items"]), "counts": _counts(db["items"])})
-            thumbs = _fetch_thumbnails(_session(cookie), targets)
+            targets = targets[:80]  # keep a refresh fast
+            recheck_report = []
             resolved = 0
-            for aid in targets:
-                _classify(db["items"][aid], thumbs.get(aid))
-                if db["items"][aid].get("status") != "pending":
-                    resolved += 1
+            if targets:
+                thumbs = _fetch_thumbnails(sess, targets)
+                for aid in targets:
+                    before = db["items"][aid].get("status")
+                    _classify(db["items"][aid], thumbs.get(aid))
+                    after = db["items"][aid].get("status")
+                    th = thumbs.get(aid) or {}
+                    recheck_report.append({"assetId": aid, "before": before,
+                                           "after": after, "state": th.get("state", ""),
+                                           "hasImage": bool(th.get("imageUrl"))})
+                    if after != "pending":
+                        resolved += 1
             _save_db(db)
-            return jsonify({"ok": True, "rechecked": len(targets), "resolved": resolved,
-                            "total": len(db["items"]), "counts": _counts(db["items"])})
+            counts = _counts(db["items"])
+            _log("recheck.done", discovered=len(discovered), rechecked=len(targets),
+                 resolved=resolved, counts=counts)
+            return jsonify({"ok": True, "discovered": len(discovered),
+                            "discoveredItems": discovered, "discoverError": disc_error,
+                            "rechecked": len(targets), "recheckReport": recheck_report,
+                            "resolved": resolved, "total": len(db["items"]),
+                            "counts": counts})
         except Exception as e:
+            _log("recheck.error", error=str(e))
             return jsonify({"error": str(e)}), 500
 
     @app.post("/decals/add")
@@ -450,6 +517,35 @@ def register(app, roblox_cookie=None):
             return jsonify({"ok": True, "item": entry})
         except Exception as e:
             return jsonify({"error": str(e)}), 500
+
+    @app.get("/decals/log")
+    def decals_log():
+        """PUBLIC: recent raw server events (upload/sync/recheck/list) as JSON."""
+        try:
+            limit = int(request.args.get("limit") or 120)
+        except Exception:
+            limit = 120
+        limit = max(1, min(limit, 400))
+        evs = list(_EVENTS)[-limit:]
+        return jsonify({"events": evs, "count": len(evs), "now": int(time.time() * 1000)})
+
+    @app.get("/decals/diag")
+    def decals_diag():
+        """PUBLIC: config + DB snapshot for debugging. Never exposes cookie values."""
+        db = _load_db()
+        items = list(db["items"].values())
+        counts = {}
+        for v in items:
+            counts[v.get("status", "?")] = counts.get(v.get("status", "?"), 0) + 1
+        items_sorted = sorted(items, key=lambda x: (x.get("created") or "", x.get("addedAt") or 0), reverse=True)
+        sample = [{"assetId": v.get("assetId"), "status": v.get("status"),
+                   "state": v.get("state", ""), "hasImage": bool(v.get("imageUrl")),
+                   "created": v.get("created", ""), "addedAt": v.get("addedAt", 0),
+                   "owner": v.get("owner", "")} for v in items_sorted[:15]]
+        return jsonify({"ok": True, "cookiesConfigured": len(_cookies()),
+                        "adminKeySet": bool(_admin_key()), "dbPath": DB_PATH, "dbDir": _DIR,
+                        "totalStored": len(items), "counts": counts,
+                        "updatedAt": db.get("updatedAt", 0), "latest": sample})
 
     @app.get("/decals/export")
     def decals_export():
@@ -509,6 +605,7 @@ def register(app, roblox_cookie=None):
         if not show_all:
             items = [v for v in items if v.get("status") in ("ok", "pending", "blank", "error")]
         items.sort(key=lambda x: (x.get("created") or "", x.get("addedAt") or 0), reverse=True)
+        _log("list", showAll=show_all, returned=len(items), totalStored=len(db["items"]))
         return jsonify({"items": items, "updatedAt": db.get("updatedAt", 0),
                         "totalStored": len(db["items"]),
                         "adminRequired": bool(_admin_key())})
@@ -529,5 +626,5 @@ def register(app, roblox_cookie=None):
             return send_file(GALLERY_HTML)
         return Response("decal_gallery.html not found (in production the gallery is served by Vercel at /decal).", status=404)
 
-    print("[decal_db] addon active → /decals, /decals/sync, /decals/rescan, /decals/recheck, /decals/add, /decals/export, /decals/import, /gallery"
+    print("[decal_db] addon active → /decals, /decals/sync, /decals/rescan, /decals/recheck, /decals/add, /decals/log, /decals/diag, /decals/export, /decals/import, /gallery"
           + (" (admin-gated)" if _admin_key() else " (OPEN - set DECAL_ADMIN_KEY for public!)"))
