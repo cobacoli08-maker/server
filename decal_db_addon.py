@@ -183,6 +183,29 @@ def _fetch_thumbnails(s, asset_ids):
     return out
 
 
+def _fetch_created_dates(s, asset_ids):
+    """Return {assetId: created_iso}. The creations API does NOT include the real
+    upload date, so we read it from the develop assets API (the same "Created"
+    date Roblox shows on the asset page, e.g. "Created Jul 14, 2026")."""
+    out = {}
+    for i in range(0, len(asset_ids), 50):
+        batch = asset_ids[i:i + 50]
+        try:
+            r = s.get("https://develop.roblox.com/v1/assets",
+                      params={"assetIds": ",".join(batch)}, timeout=30)
+            if r.status_code != 200:
+                continue
+            for d in (r.json().get("data") or []):
+                aid = str(d.get("id") or d.get("assetId") or "")
+                c = d.get("created") or d.get("createdTime") or ""
+                if aid and c:
+                    out[aid] = c
+        except Exception as e:
+            print("[decal_db] created-date fetch error:", e)
+        time.sleep(0.15)
+    return out
+
+
 def _classify(entry, thumb, deep_blank_check=True):
     state = (thumb or {}).get("state", "")
     img = (thumb or {}).get("imageUrl", "")
@@ -272,11 +295,12 @@ def register(app, roblox_cookie=None):
                 created = _fetch_all_created_decals(s)
                 print(f"[decal_db] {owner}: found {len(created)} decals, checking thumbnails...")
                 thumbs = _fetch_thumbnails(s, [c["assetId"] for c in created])
+                cdates = _fetch_created_dates(s, [c["assetId"] for c in created])
                 acc_added = 0
                 for c in created:
                     aid = c["assetId"]; prev = items.get(aid, {})
                     entry = {"assetId": aid, "name": c["name"],
-                             "created": c["created"] or prev.get("created", ""),
+                             "created": cdates.get(aid) or c["created"] or prev.get("created", ""),
                              "addedAt": prev.get("addedAt") or int(time.time()),
                              "owner": owner, "ownerId": uid or prev.get("ownerId", "")}
                     _classify(entry, thumbs.get(aid))
