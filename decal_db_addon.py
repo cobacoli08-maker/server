@@ -49,6 +49,12 @@ import time
 import requests as http_req
 from flask import request, jsonify, send_file, Response
 import collections
+import threading
+import tempfile
+try:
+    import fcntl  # POSIX inter-process lock (Linux / Railway)
+except Exception:
+    fcntl = None
 
 # -- debug event log (in-memory ring buffer, exposed via GET /decals/log) --
 _EVENTS = collections.deque(maxlen=400)
@@ -66,6 +72,72 @@ _DIR = (os.environ.get("DECAL_DB_DIR", "").strip() or _HERE)
 DB_PATH = os.path.join(_DIR, "decals_db.json")          # full database (internal)
 PUBLIC_SNAPSHOT = os.path.join(_DIR, "decals.json")      # snapshot for static hosting
 GALLERY_HTML = os.path.join(_HERE, "decal_gallery.html")
+
+# -- concurrency safety (many mods hitting the shared backend at once) --------
+# The whole DB is one JSON file. A naive read-modify-write loses data or reads a
+# half-written file when an upload, a sync and a gallery refresh overlap. Every
+# write goes through _mutate_db: it grabs an in-process lock AND a cross-process
+# file lock, then writes atomically (temp file + os.replace). Slow Roblox calls
+# are always done BEFORE the lock so the critical section stays tiny.
+_DB_LOCK = threading.RLock()
+_LOCK_PATH = DB_PATH + ".lock"
+_RECHECK_LOCK = threading.Lock()
+_RECHECK_STATE = {"ts": 0.0}
+_DISCOVERY_COOLDOWN = 20  # seconds; refreshes inside this window skip Roblox calls
+
+
+class _FileLock:
+    def __init__(self, path):
+        self.path = path
+        self.fh = None
+
+    def __enter__(self):
+        if fcntl is None:
+            return self
+        try:
+            self.fh = open(self.path, "w")
+            fcntl.flock(self.fh, fcntl.LOCK_EX)
+        except Exception:
+            self.fh = None
+        return self
+
+    def __exit__(self, *a):
+        if self.fh is not None:
+            try:
+                fcntl.flock(self.fh, fcntl.LOCK_UN)
+                self.fh.close()
+            except Exception:
+                pass
+            self.fh = None
+
+
+def _atomic_write_json(path, obj):
+    d = os.path.dirname(path) or "."
+    try:
+        os.makedirs(d, exist_ok=True)
+    except Exception:
+        pass
+    fd, tmp = tempfile.mkstemp(prefix=".tmp_", dir=d)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(obj, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, path)
+    finally:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except Exception:
+            pass
+
+
+def _mutate_db(mutator):
+    """Serialised, atomic read-modify-write. Do slow network work BEFORE this."""
+    with _DB_LOCK:
+        with _FileLock(_LOCK_PATH):
+            db = _load_db()
+            result = mutator(db)
+            _save_db(db)
+            return result
 
 # Blank-detection thresholds. Conservative so real images are NOT discarded.
 # A failed decal is truly flat (#FFFFFF / #000000), pixel spread ~0.
@@ -88,17 +160,11 @@ def _load_db():
 
 def _save_db(db):
     db["updatedAt"] = int(time.time())
-    try:
-        os.makedirs(_DIR, exist_ok=True)
-    except Exception:
-        pass
-    with open(DB_PATH, "w", encoding="utf-8") as f:
-        json.dump(db, f, ensure_ascii=False, indent=2)
+    _atomic_write_json(DB_PATH, db)
     ok = [v for v in db["items"].values() if v.get("status") in ("ok", "pending", "blank", "error")]
     ok.sort(key=lambda x: x.get("created") or "", reverse=True)
     try:
-        with open(PUBLIC_SNAPSHOT, "w", encoding="utf-8") as f:
-            json.dump({"items": ok, "updatedAt": db["updatedAt"]}, f, ensure_ascii=False, indent=2)
+        _atomic_write_json(PUBLIC_SNAPSHOT, {"items": ok, "updatedAt": db["updatedAt"]})
     except Exception as e:
         print("[decal_db] failed to write snapshot:", e)
 
@@ -157,6 +223,13 @@ def _fetch_all_created_decals(s, max_pages=200):
             params["cursor"] = cursor
         r = s.get("https://itemconfiguration.roblox.com/v1/creations/get-assets",
                   params=params, timeout=30)
+        _bo = 0
+        while r.status_code == 429 and _bo < 3:
+            _bo += 1
+            _log("roblox.rate_limited", api="creations", tries=_bo)
+            time.sleep(1.5 * _bo)
+            r = s.get("https://itemconfiguration.roblox.com/v1/creations/get-assets",
+                      params=params, timeout=30)
         if r.status_code == 401:
             raise RuntimeError("Cookie expired / invalid (401).")
         if r.status_code != 200:
@@ -244,38 +317,51 @@ def _classify(entry, thumb, deep_blank_check=True):
 
 # ── register ───────────────────────────────────────────────
 def register_uploaded_decal(asset_id, name="", cookie=None):
-    """Immediately add a freshly-uploaded decal to the shared DB so it appears on
-    /decal right away, WITHOUT waiting for a full "Sync from Roblox". Safe to call
-    from the upload route; returns the stored entry (or None for an invalid id)."""
+    """Immediately add a freshly-uploaded decal to the shared DB so it shows on
+    /decal right away. Roblox calls run FIRST (no lock); the DB write is then a
+    short, serialised, atomic read-modify-write so concurrent uploads/refreshes
+    can never clobber each other."""
     aid = str(asset_id or "").strip()
     if not aid.isdigit():
         return None
     cookie = cookie or os.environ.get("ROBLOX_COOKIE", "").strip()
-    db = _load_db()
-    prev = db["items"].get(aid, {})
-    entry = {"assetId": aid,
-             "name": (name or "").strip() or prev.get("name") or ("Decal " + aid),
-             "created": prev.get("created", ""),
-             "addedAt": prev.get("addedAt") or int(time.time()),
-             "owner": prev.get("owner", ""), "ownerId": prev.get("ownerId", "")}
+    net = {}
     try:
         if cookie:
             sess = _session(cookie)
             uid, uname = _whoami(sess)
             if uname:
-                entry["owner"] = uname; entry["ownerId"] = uid or entry.get("ownerId", "")
+                net["owner"] = uname
+                net["ownerId"] = uid or ""
             cd = _fetch_created_dates(sess, [aid])
             if cd.get(aid):
-                entry["created"] = cd[aid]
-            thumbs = _fetch_thumbnails(sess, [aid])
-            _classify(entry, thumbs.get(aid))
+                net["created"] = cd[aid]
+            net["thumb"] = _fetch_thumbnails(sess, [aid]).get(aid)
+            net["ok"] = True
         else:
-            entry.setdefault("status", "ok")
+            net["nocookie"] = True
     except Exception as e:
         print("[decal_db] register_uploaded_decal error:", e)
-        entry.setdefault("status", "pending")
-    db["items"][aid] = entry
-    _save_db(db)
+        net["err"] = str(e)
+
+    def _apply(db):
+        prev = db["items"].get(aid, {})
+        entry = {"assetId": aid,
+                 "name": (name or "").strip() or prev.get("name") or ("Decal " + aid),
+                 "created": net.get("created") or prev.get("created", ""),
+                 "addedAt": prev.get("addedAt") or int(time.time()),
+                 "owner": net.get("owner") or prev.get("owner", ""),
+                 "ownerId": net.get("ownerId") or prev.get("ownerId", "")}
+        if net.get("ok"):
+            _classify(entry, net.get("thumb"))
+        elif net.get("nocookie"):
+            entry.setdefault("status", "ok")
+        else:
+            entry.setdefault("status", "pending")
+        db["items"][aid] = entry
+        return entry
+
+    entry = _mutate_db(_apply)
     _log("upload.register", assetId=aid, status=entry.get("status"),
          state=entry.get("state", ""), hasImage=bool(entry.get("imageUrl")),
          hasCookie=bool(cookie), name=entry.get("name"))
@@ -336,43 +422,60 @@ def register(app, roblox_cookie=None):
         cookies = _cookies()
         if not cookies:
             return jsonify({"error": "ROBLOX_COOKIE is not set."}), 500
-        db = _load_db(); items = db["items"]
-        _log("sync.start", cookies=len(cookies), dbCount=len(items))
-        added = 0
-        accounts = []          # per-account report
-        errors = []            # dead/banned/expired cookies etc.
+        _log("sync.start", cookies=len(cookies))
+        fetched = {}          # aid -> entry (built from Roblox, no lock held)
+        accounts = []
+        errors = []
         for idx, cookie in enumerate(cookies, 1):
             try:
                 s = _session(cookie)
                 uid, uname = _whoami(s)
                 owner = uname or ("account #%d" % idx)
                 created = _fetch_all_created_decals(s)
-                print(f"[decal_db] {owner}: found {len(created)} decals, checking thumbnails...")
-                thumbs = _fetch_thumbnails(s, [c["assetId"] for c in created])
-                cdates = _fetch_created_dates(s, [c["assetId"] for c in created])
-                acc_added = 0
+                print("[decal_db] %s: found %d decals, checking thumbnails..." % (owner, len(created)))
+                ids = [c["assetId"] for c in created]
+                thumbs = _fetch_thumbnails(s, ids)
+                cdates = _fetch_created_dates(s, ids)
                 for c in created:
-                    aid = c["assetId"]; prev = items.get(aid, {})
+                    aid = c["assetId"]
                     entry = {"assetId": aid, "name": c["name"],
-                             "created": cdates.get(aid) or c["created"] or prev.get("created", ""),
-                             "addedAt": prev.get("addedAt") or int(time.time()),
-                             "owner": owner, "ownerId": uid or prev.get("ownerId", "")}
+                             "created": cdates.get(aid) or c["created"] or "",
+                             "owner": owner, "ownerId": uid or ""}
                     _classify(entry, thumbs.get(aid))
-                    if aid not in items:
-                        added += 1; acc_added += 1
-                    items[aid] = entry
-                accounts.append({"owner": owner, "ownerId": uid,
-                                 "found": len(created), "newlyAdded": acc_added})
+                    fetched[aid] = entry
+                accounts.append({"owner": owner, "ownerId": uid or "",
+                                 "found": len(created), "newlyAdded": 0})
             except Exception as e:
                 print("[decal_db] sync error (account #%d):" % idx, e)
                 errors.append({"account": idx, "error": str(e)})
-        _save_db(db)
+
+        def _apply(db):
+            items = db["items"]
+            added = 0
+            new_by_owner = {}
+            for aid, entry in fetched.items():
+                prev = items.get(aid, {})
+                entry["addedAt"] = prev.get("addedAt") or int(time.time())
+                if not entry.get("created"):
+                    entry["created"] = prev.get("created", "")
+                if aid not in items:
+                    added += 1
+                    ow = entry.get("ownerId") or ""
+                    new_by_owner[ow] = new_by_owner.get(ow, 0) + 1
+                items[aid] = entry
+            return added, new_by_owner
+
+        added, new_by_owner = _mutate_db(_apply)
+        for acc in accounts:
+            acc["newlyAdded"] = new_by_owner.get(acc.get("ownerId") or "", 0)
+        db_after = _load_db()
         counts = {}
-        for v in items.values():
+        for v in db_after["items"].values():
             counts[v.get("status", "?")] = counts.get(v.get("status", "?"), 0) + 1
-        _log("sync.done", total=len(items), newlyAdded=added,
+        total = len(db_after["items"])
+        _log("sync.done", total=total, newlyAdded=added,
              accounts=accounts, errors=errors, counts=counts)
-        return jsonify({"ok": True, "total": len(items), "newlyAdded": added,
+        return jsonify({"ok": True, "total": total, "newlyAdded": added,
                         "accountsSynced": len(accounts), "accounts": accounts,
                         "errors": errors, "counts": counts})
 
@@ -399,17 +502,14 @@ def register(app, roblox_cookie=None):
 
     @app.post("/decals/recheck")
     def decals_recheck():
-        """PUBLIC (no admin). Runs on every gallery Refresh. Does two things the
-        browser cannot do (Roblox blocks CORS on thumbnails.roblox.com):
-          1) DISCOVER new decals -> pulls the newest page (~50) of the account's
-             created decals, so a brand-new upload appears on Refresh even if
-             auto-register at upload time failed/timed out. (This is why plain
-             Refresh used to do nothing and only Sync worked: Refresh never
-             discovered new decals.)
-          2) RE-CHECK unsettled items (pending/error) so thumbnails resolve.
-        Everything is logged to GET /decals/log with raw counts / ids / states."""
-        cookie = _cookie()
-        if not cookie:
+        """PUBLIC (no admin). Runs on every gallery Refresh. Two jobs the browser
+        cannot do (Roblox blocks CORS): (1) DISCOVER brand-new uploads across ALL
+        configured accounts by pulling each account newest page, and (2) RE-CHECK
+        unsettled items so thumbnails resolve. To stay safe when many mods refresh
+        at the same time, Roblox calls are throttled by a short cooldown and the
+        DB write is a single serialised, atomic merge."""
+        cookies = _cookies()
+        if not cookies:
             _log("recheck.no_cookie")
             return jsonify({"error": "ROBLOX_COOKIE is not set."}), 500
 
@@ -421,69 +521,97 @@ def register(app, roblox_cookie=None):
 
         body = request.get_json(silent=True) or {}
         want = [str(x).strip() for x in (body.get("ids") or []) if str(x).strip().isdigit()]
-        _log("recheck.start", wantIds=want)
+        now = time.time()
+        with _RECHECK_LOCK:
+            since = now - _RECHECK_STATE["ts"]
+            in_cooldown = (not want) and _RECHECK_STATE["ts"] > 0 and since < _DISCOVERY_COOLDOWN
+            if not in_cooldown:
+                _RECHECK_STATE["ts"] = now
+        if in_cooldown:
+            db = _load_db()
+            _log("recheck.cooldown", sinceSec=round(since, 1), coolSec=_DISCOVERY_COOLDOWN)
+            return jsonify({"ok": True, "cooldown": True,
+                            "cooldownRemaining": round(_DISCOVERY_COOLDOWN - since, 1),
+                            "discovered": 0, "discoveredItems": [], "discoverError": None,
+                            "rechecked": 0, "recheckReport": [], "resolved": 0,
+                            "total": len(db["items"]), "counts": _counts(db["items"])})
+
+        _log("recheck.start", wantIds=want, cookies=len(cookies))
         try:
             db = _load_db()
-            sess = _session(cookie)
-
-            # 1) discover the newest decals (first page only = fast)
-            discovered = []
+            existing = set(db["items"].keys())
+            discovered = {}
             disc_error = None
-            try:
-                latest = _fetch_all_created_decals(sess, max_pages=1)
-                new_ids = [c["assetId"] for c in latest if c["assetId"] not in db["items"]]
-                if new_ids:
-                    uid, uname = _whoami(sess)
-                    dthumbs = _fetch_thumbnails(sess, new_ids)
-                    dcdates = _fetch_created_dates(sess, new_ids)
-                    for c in latest:
-                        aid = c["assetId"]
-                        if aid in db["items"]:
-                            continue
-                        entry = {"assetId": aid, "name": c["name"],
-                                 "created": dcdates.get(aid) or c["created"] or "",
-                                 "addedAt": int(time.time()),
-                                 "owner": uname or "", "ownerId": uid or ""}
-                        _classify(entry, dthumbs.get(aid))
-                        db["items"][aid] = entry
-                        discovered.append({"assetId": aid, "status": entry.get("status"),
-                                           "state": entry.get("state", "")})
-                _log("recheck.discovered", latestPage=len(latest),
-                     newCount=len(discovered), newItems=discovered)
-            except Exception as de:
-                disc_error = str(de)
-                _log("recheck.discover_error", error=disc_error)
+            per_account = []
+            for idx, cookie in enumerate(cookies, 1):
+                try:
+                    sess = _session(cookie)
+                    latest = _fetch_all_created_decals(sess, max_pages=1)
+                    new_ids = [c["assetId"] for c in latest
+                               if c["assetId"] not in existing and c["assetId"] not in discovered]
+                    acc_new = 0
+                    if new_ids:
+                        uid, uname = _whoami(sess)
+                        dthumbs = _fetch_thumbnails(sess, new_ids)
+                        dcdates = _fetch_created_dates(sess, new_ids)
+                        for c in latest:
+                            aid = c["assetId"]
+                            if aid in existing or aid in discovered:
+                                continue
+                            entry = {"assetId": aid, "name": c["name"],
+                                     "created": dcdates.get(aid) or c["created"] or "",
+                                     "addedAt": int(now),
+                                     "owner": uname or "", "ownerId": uid or ""}
+                            _classify(entry, dthumbs.get(aid))
+                            discovered[aid] = entry
+                            acc_new += 1
+                    per_account.append({"account": idx, "latestPage": len(latest), "newCount": acc_new})
+                except Exception as de:
+                    disc_error = str(de)
+                    _log("recheck.discover_error", account=idx, error=disc_error)
+            _log("recheck.discovered", accounts=per_account, newCount=len(discovered),
+                 newItems=[{"assetId": a, "status": e.get("status"), "state": e.get("state", "")}
+                           for a, e in discovered.items()])
 
-            # 2) re-check unsettled items
             if want:
-                targets = [aid for aid in want if aid in db["items"]]
+                targets = [a for a in want if a in existing or a in discovered]
             else:
                 targets = [aid for aid, v in db["items"].items()
                            if v.get("status") in ("pending", "error", "")]
-            targets = targets[:80]  # keep a refresh fast
-            recheck_report = []
-            resolved = 0
-            if targets:
-                thumbs = _fetch_thumbnails(sess, targets)
+            targets = targets[:80]
+            thumbs = _fetch_thumbnails(_session(cookies[0]), targets) if targets else {}
+
+            def _apply(fresh):
+                items = fresh["items"]
+                for aid, entry in discovered.items():
+                    if aid not in items:
+                        items[aid] = entry
+                rep_list = []
+                res = 0
                 for aid in targets:
-                    before = db["items"][aid].get("status")
-                    _classify(db["items"][aid], thumbs.get(aid))
-                    after = db["items"][aid].get("status")
+                    if aid not in items:
+                        continue
+                    before = items[aid].get("status")
+                    _classify(items[aid], thumbs.get(aid))
+                    after = items[aid].get("status")
                     th = thumbs.get(aid) or {}
-                    recheck_report.append({"assetId": aid, "before": before,
-                                           "after": after, "state": th.get("state", ""),
-                                           "hasImage": bool(th.get("imageUrl"))})
+                    rep_list.append({"assetId": aid, "before": before, "after": after,
+                                     "state": th.get("state", ""), "hasImage": bool(th.get("imageUrl"))})
                     if after != "pending":
-                        resolved += 1
-            _save_db(db)
-            counts = _counts(db["items"])
+                        res += 1
+                return {"report": rep_list, "resolved": res,
+                        "total": len(items), "counts": _counts(items)}
+
+            out = _mutate_db(_apply)
             _log("recheck.done", discovered=len(discovered), rechecked=len(targets),
-                 resolved=resolved, counts=counts)
+                 resolved=out["resolved"], counts=out["counts"])
             return jsonify({"ok": True, "discovered": len(discovered),
-                            "discoveredItems": discovered, "discoverError": disc_error,
-                            "rechecked": len(targets), "recheckReport": recheck_report,
-                            "resolved": resolved, "total": len(db["items"]),
-                            "counts": counts})
+                            "discoveredItems": [{"assetId": a, "status": e.get("status"),
+                                                 "state": e.get("state", "")}
+                                                for a, e in discovered.items()],
+                            "discoverError": disc_error, "rechecked": len(targets),
+                            "recheckReport": out["report"], "resolved": out["resolved"],
+                            "total": out["total"], "counts": out["counts"]})
         except Exception as e:
             _log("recheck.error", error=str(e))
             return jsonify({"error": str(e)}), 500
