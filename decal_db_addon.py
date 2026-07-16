@@ -230,6 +230,43 @@ def _classify(entry, thumb, deep_blank_check=True):
 
 
 # ── register ───────────────────────────────────────────────
+def register_uploaded_decal(asset_id, name="", cookie=None):
+    """Immediately add a freshly-uploaded decal to the shared DB so it appears on
+    /decal right away, WITHOUT waiting for a full "Sync from Roblox". Safe to call
+    from the upload route; returns the stored entry (or None for an invalid id)."""
+    aid = str(asset_id or "").strip()
+    if not aid.isdigit():
+        return None
+    cookie = cookie or os.environ.get("ROBLOX_COOKIE", "").strip()
+    db = _load_db()
+    prev = db["items"].get(aid, {})
+    entry = {"assetId": aid,
+             "name": (name or "").strip() or prev.get("name") or ("Decal " + aid),
+             "created": prev.get("created", ""),
+             "addedAt": prev.get("addedAt") or int(time.time()),
+             "owner": prev.get("owner", ""), "ownerId": prev.get("ownerId", "")}
+    try:
+        if cookie:
+            sess = _session(cookie)
+            uid, uname = _whoami(sess)
+            if uname:
+                entry["owner"] = uname; entry["ownerId"] = uid or entry.get("ownerId", "")
+            cd = _fetch_created_dates(sess, [aid])
+            if cd.get(aid):
+                entry["created"] = cd[aid]
+            thumbs = _fetch_thumbnails(sess, [aid])
+            _classify(entry, thumbs.get(aid))
+        else:
+            entry.setdefault("status", "ok")
+    except Exception as e:
+        print("[decal_db] register_uploaded_decal error:", e)
+        entry.setdefault("status", "pending")
+    db["items"][aid] = entry
+    _save_db(db)
+    print("[decal_db] auto-registered uploaded decal", aid, "->", entry.get("status"))
+    return entry
+
+
 def register(app, roblox_cookie=None):
     """register(app) -> cookie from ENV; or register(app, COOKIE) for local use."""
 

@@ -263,6 +263,11 @@ def upload_decal():
                 if poll_data.get("done"):
                     asset_id = poll_data.get("response", {}).get("assetId")
                     if asset_id:
+                        try:
+                            import decal_db_addon
+                            decal_db_addon.register_uploaded_decal(asset_id, decal_name)
+                        except Exception as _reg_e:
+                            print("[upload_decal] auto-register to DB failed:", _reg_e)
                         return jsonify({"decal_id": str(asset_id)})
                     return jsonify({"error": "Upload done but assetId missing"}), 500
 
