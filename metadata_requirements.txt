@@ -4,3 +4,4 @@ ytmusicapi
 pykakasi
 requests
 yt-dlp
+pillow

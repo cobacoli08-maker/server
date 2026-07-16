@@ -11,7 +11,7 @@ import re
 import difflib
 
 # ── .env loader (for LOCAL TESTING) ─────────────────────────────────────
-# Kalau ada file `.env` sefolder, baca KEY=VALUE ke os.environ.
+# If there is a `.env` file in the same folder, read KEY=VALUE into os.environ.
 # Existing env (e.g. Railway Variables) is NOT overwritten -> production keeps using Railway.
 def _load_dotenv():
     path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
@@ -28,7 +28,7 @@ def _load_dotenv():
                 val = val.strip().strip('"').strip("'")
                 if key and key not in os.environ:
                     os.environ[key] = val
-        print("\u2705 .env loaded (test lokal)")
+        print("\u2705 .env loaded (local test)")
     except Exception as e:
         print("\u26a0\ufe0f  failed to read .env:", e)
 
@@ -971,8 +971,8 @@ def cari_anime():
 
 # ── AI auto-pool: stateless multi-provider fallback ("OmniRoute-lite") ──
 # Replaces the stateful OmniRoute hosting. ALL config via ENV, so:
-#   host mati -> host baru -> paste ENV yg sama -> langsung jalan lagi.
-# Tiap provider OpenAI-compatible /chat/completions. Provider di-SKIP kalau
+#   host down -> new host -> paste the same ENV -> works again immediately.
+# Each provider is OpenAI-compatible /chat/completions. A provider is SKIPPED if
 # its ENV key is empty. Tried in order (top = priority); first success wins.
 AI_TIMEOUT_SEC = int(os.environ.get("AI_TIMEOUT_SEC", "25"))
 
@@ -995,7 +995,7 @@ _AI_THINK_RE = re.compile(r"<think>.*?</think>\s*", re.DOTALL | re.IGNORECASE)
 
 
 def _clean_ai_output(text):
-    """Buang blok reasoning <think>...</think> dari model thinking (qwen/glm)."""
+    """Strip the reasoning block <think>...</think> from thinking models (qwen/glm)."""
     if not text:
         return text
     text = _AI_THINK_RE.sub("", text)
@@ -1081,6 +1081,18 @@ try:
     print("✅ lyric_sync_addon registered (/search_songs, /fetch_lyrics, /web_lyrics, /sync_lyrics)")
 except Exception as _e:
     print("⚠️ lyric_sync_addon not loaded:", _e)
+
+
+# ── Decal Database add-on ────────────────────────────────────
+# Stores all decals uploaded by the shared account + a public gallery at /decal
+# (Vercel). The cookie is read from ENV ROBLOX_COOKIE. Set DECAL_ADMIN_KEY so
+# sync/delete are admin-only. Requires pillow (listed in metadata_requirements.txt).
+try:
+    import decal_db_addon
+    decal_db_addon.register(app)
+    print("✅ decal_db_addon registered (/decals, /decals/sync, /decals/rescan, /gallery)")
+except Exception as _e:
+    print("⚠️ decal_db_addon not loaded:", _e)
 
 
 if __name__ == "__main__":

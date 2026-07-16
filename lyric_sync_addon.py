@@ -163,17 +163,17 @@ def _split_units(ruby_str):
 
 
 # ── timing + reading tuning ──────────────────────────────────
-# Pace "natural" per-mora (detik). Dipakai biar mora GA di-smear rata ke
-# seluruh jeda antar-baris. Bug utama: baris pendek + jeda instrumen panjang
-# bikin tiap mora molor 1-2 detik. Naikin = lebih lambat, turunin = lebih cepat.
+# "Natural" per-mora pace (seconds). Used so morae are NOT smeared evenly
+# across the whole inter-line gap. Main bug: short line + long instrumental gap
+# make each mora stretch 1-2 seconds. Higher = slower, lower = faster.
 MORA_PACE = 0.34
 
-# Override bacaan kanji yg sering salah ditebak pykakasi di konteks lirik.
-# key = surface token persis dari pykakasi, value = hiragana yg bener.
-# Tambahin sendiri kalau nemu yg lain.
+# Override kanji readings pykakasi often mis-guesses in lyric context.
+# key = exact surface token from pykakasi, value = the correct hiragana.
+# Add your own if you find others.
 READING_OVERRIDES = {
-    '君': 'きみ',    # default 'くん' -> di lirik hampir selalu 'きみ'
-    '日': 'ひ',      # standalone 日 -> ひ (今日/明日 di-token terpisah, aman)
+    '君': 'きみ',    # default 'くん' -> in lyrics almost always 'きみ'
+    '日': 'ひ',      # standalone 日 -> ひ (今日/明日 are tokenized separately, safe)
     '傍': 'そば',    # default 'ぼう'
     '何処': 'どこ',
     '何時': 'いつ',
@@ -181,8 +181,8 @@ READING_OVERRIDES = {
 
 
 def _mora_count(s):
-    """Jumlah mora kasar: small-kana + ー nempel ke mora sebelumnya (ga nambah),
-    sisanya 1 mora per char."""
+    """Rough mora count: small-kana + ー attach to the previous mora (no increment),
+    everything else counts as 1 mora per char."""
     c = 0
     for ch in s:
         if ch in SMALL_KANA or ch == 'ー':
@@ -196,8 +196,8 @@ _PUNCT_ONLY = set('（）()「」『』、。,.!?！？…‥・♪~〜ー—-"\
 
 
 def _unit_weight(u):
-    """Bobot durasi tiap unit. Kanji+furigana = panjang bacaan (mora),
-    kana = 1, romaji = sub-mora (~0.35/char), tanda baca = ringan."""
+    """Duration weight per unit. Kanji+furigana = reading length (mora),
+    kana = 1, romaji = sub-mora (~0.35/char), punctuation = light."""
     if '[' in u and u.endswith(']'):
         reading = u[u.index('[') + 1:-1]
         return float(_mora_count(reading))
@@ -236,13 +236,13 @@ def convert_line(text, start, end, track=2):
         start = 0.0
     weights = [_unit_weight(u) for (u, sp) in units]
     total_w = sum(weights) or 1.0
-    # durasi "natural" kalau dinyanyiin normal
+    # "natural" duration if sung normally
     natural = total_w * MORA_PACE
-    # span dari sumber (end = start baris berikutnya). Kalau None/aneh -> natural.
+    # span from source (end = start of next line). If None/weird -> natural.
     span = (end - start) if (end is not None and end > start) else natural
-    # KUNCI FIX: jangan smear ke jeda panjang. Kalau jeda jauh lebih gede dari
-    # durasi natural, batasi ke natural (sisanya jadi jeda instrumen, mora ga
-    # molor). Kalau bagian cepat (span < natural), tetap muat ke span.
+    # KEY FIX: do not smear into long gaps. If the gap is far larger than the
+    # natural duration, clamp to natural (the rest becomes an instrumental gap, morae don't
+    # stretch). If it's a fast part (span < natural), still fit to span.
     eff = min(span, natural)
     out = [f"[{_fmt(start)}][T:{track}]"]
     acc = 0.0
@@ -250,8 +250,8 @@ def convert_line(text, start, end, track=2):
         t = start + eff * (acc / total_w)
         out.append((' ' if sp else '') + f"<{_fmt(t)}>{u}")
         acc += w
-    # Terminator ' /' TIDAK ditambah di sini — editor (buildLRC) yang otomatis
-    # nambah pas export; kalau dobel -> '//' pas import.
+    # Terminator ' /' is NOT added here — the editor (buildLRC) adds it
+    # automatically on export; doubling -> '//' on import.
     return ''.join(out)
 
 
@@ -756,11 +756,11 @@ def _scrape_jlyric(title, artist, dbg):
 def _scrape_any(url, dbg):
     u = (url or '').lower()
     trail = dbg.setdefault('web', {}).setdefault('trail', [])
-    # PENTING: URL YouTube / non-lirik DITOLAK. Dulu bug: user tempel link
-    # youtu.be -> generic scrape ngambil teks Jepang acak dari halaman YT ->
-    # 6 baris sampah masuk ke project. Sekarang cuma situs lirik yg discrape.
+    # IMPORTANT: YouTube / non-lyric URLs are REJECTED. Old bug: user pastes a
+    # youtu.be link -> generic scrape grabs random Japanese text from the YT page ->
+    # 6 junk lines end up in the project. Now only lyric sites are scraped.
     if 'youtube.com' in u or 'youtu.be' in u or 'music.youtube' in u:
-        trail.append('scrape: URL YouTube ditolak (itu bukan situs lirik)')
+        trail.append('scrape: YouTube URL rejected (not a lyric site)')
         return []
     if 'letras.com' in u or 'letras.mus.br' in u:
         return _scrape_letras(url, dbg)
@@ -772,20 +772,20 @@ def _scrape_any(url, dbg):
         sp = _http_text(url)
         mm = re.search(r'(?is)<p[^>]*id="Lyric"[^>]*>(.*?)</p>', sp)
         return [ln for ln in _html_to_lines(mm.group(1)) if _has_jp(ln)] if mm else []
-    trail.append('scrape: domain gak didukung (cuma letras/uta-net/j-lyric)')
+    trail.append('scrape: domain not supported (only letras/uta-net/j-lyric)')
     return []
 
 
 def _web_lyrics(title, artist, query, url, pasted, dbg):
     trail = dbg.setdefault('web', {}).setdefault('trail', [])
     q = (query or ('%s %s' % (title, artist))).strip()
-    # SUMBER 1 (paling reliable): lirik yg user tempel sendiri dari web.
-    # Ini nggak butuh internet dari sisi bot & nggak bisa salah ambil.
+    # SOURCE 1 (most reliable): lyrics the user pasted themselves from the web.
+    # Needs no internet on the bot side & cannot fetch the wrong thing.
     if pasted:
         plines = [ln.replace('\u3000', ' ').strip()
                   for ln in pasted.replace('\r', '\n').split('\n')]
         plines = [ln for ln in plines if ln and _has_jp(ln)]
-        trail.append('pasted: %d baris JP' % len(plines))
+        trail.append('pasted: %d JP lines' % len(plines))
         if plines:
             return plines, 'pasted'
     tasks = []
@@ -813,10 +813,10 @@ def _web_lyrics(title, artist, query, url, pasted, dbg):
 
 
 def _web_gap_fill(web_texts, base_lines, dbg):
-    """Sejajarkan lirik-web dgn timeline DASAR (rext editor ATAU baris YT).
-    Baris web yg TIDAK ketemu di baris dasar = 'hilang' -> ditaruh di antara
-    dua anchor yg match dgn timestamp interpolasi. base_lines cuma acuan waktu:
-    bisa {text,start,end} (YT) atau {text,time} (editor rext)."""
+    """Align web lyrics with the BASE timeline (editor text OR YT lines).
+    Web lines NOT found in the base lines = 'missing' -> placed between
+    two matching anchors with interpolated timestamps. base_lines is only a time reference:
+    can be {text,start,end} (YT) or {text,time} (editor text)."""
     web_norm = [_norm(t) for t in web_texts]
     trail = dbg.setdefault('web', {}).setdefault('trail', [])
 
@@ -845,7 +845,7 @@ def _web_gap_fill(web_texts, base_lines, dbg):
                 best_r, best_i = r, i
         return best_i if best_r >= 0.72 else -1
 
-    # anchor = baris dasar yg cocok ke salah satu baris web & punya waktu
+    # anchor = base line matching one of the web lines & having a time
     anchors = []
     for l in base_lines:
         wi = _widx(l.get('text', ''))
@@ -853,10 +853,10 @@ def _web_gap_fill(web_texts, base_lines, dbg):
         if wi >= 0 and t is not None:
             anchors.append((wi, t))
     anchors.sort(key=lambda a: a[0])
-    trail.append('align: %d baris web, %d/%d baris dasar jadi anchor' % (
+    trail.append('align: %d web lines, %d/%d base lines became anchors' % (
         len(web_texts), len(anchors), len(base_lines)))
     if len(anchors) < 2:
-        trail.append('align: butuh >=2 anchor cocok; kurang -> ga bisa taruh timeline')
+        trail.append('align: need >=2 matching anchors; too few -> cannot place timeline')
         return []
 
     out, used = [], set()
@@ -946,11 +946,11 @@ def register(app, ytmusic):
                         break
             dbg['resolvedVideoId'] = video_id
             if not video_id:
-                return jsonify({'error': 'Tidak ketemu videoId. Tempel link YouTube/YT Music '
-                                         'atau pakai tombol Search dulu.', 'debug': dbg}), 404
+                return jsonify({'error': 'videoId not found. Paste a YouTube/YT Music link '
+                                         'or use the Search button first.', 'debug': dbg}), 404
 
             lines, has_ts, source = [], False, None
-            # 1) yt-dlp subtitles (paling lengkap)
+            # 1) yt-dlp subtitles (most complete)
             try:
                 sub, kind = _ytdlp_subs(video_id, dbg)
                 if sub and any(l.get('start') is not None for l in sub):
@@ -993,7 +993,7 @@ def register(app, ytmusic):
             dbg['hasTimestamps'] = has_ts
             dbg['source'] = source
             if not lines:
-                return jsonify({'error': 'videoId ketemu tapi lirik kosong di semua sumber.',
+                return jsonify({'error': 'videoId found but lyrics empty in all sources.',
                                 'videoId': video_id, 'song': song, 'debug': dbg}), 404
             return jsonify({'videoId': video_id, 'song': song, 'hasTimestamps': has_ts,
                             'source': source, 'lines': lines, 'debug': dbg})
@@ -1023,7 +1023,7 @@ def register(app, ytmusic):
             dbg['lineCount'] = len(lines)
             dbg['source'] = src
             gap_fill = _web_gap_fill(lines, base_lines, dbg) if base_lines else []
-            # kasih LRC per baris biar bisa langsung Import tanpa Sync lagi
+            # give per-line LRC so it can be imported directly without Sync again
             for g in gap_fill:
                 try:
                     g['lrc'] = convert_line(g['text'], g.get('start'), g.get('end'), track)
@@ -1032,9 +1032,9 @@ def register(app, ytmusic):
             dbg['gapFillCount'] = len(gap_fill)
             if not lines:
                 return jsonify({
-                    'error': 'Lirik web kosong. Tempel lirik lengkap di kolom '
-                             '"Tempel lirik", ATAU kasih URL dari letras.com / '
-                             'uta-net / j-lyric. URL YouTube TIDAK dipakai di sini.',
+                    'error': 'Web lyrics empty. Paste the full lyrics into the '
+                             '"Paste lyrics" field, OR provide a URL from letras.com / '
+                             'uta-net / j-lyric. YouTube URLs are NOT used here.',
                     'lines': [], 'gapFill': [], 'debug': dbg}), 404
             return jsonify({'source': src,
                             'lines': [{'text': t} for t in lines],
@@ -1079,8 +1079,8 @@ def register(app, ytmusic):
             dbg['newCount'] = new_ct
             note = None
             if not has_ts:
-                note = ('Lirik ini TANPA timestamp dari sumber, jadi baris NEW tidak bisa '
-                        'ditaruh di timeline. Coba sumber lain (yt-dlp caption / LRCLIB).')
+                note = ('These lyrics have NO timestamps from the source, so NEW lines cannot '
+                        'be placed on the timeline. Try another source (yt-dlp caption / LRCLIB).')
             return jsonify({'anchors': len(anchors), 'offset': round(offset, 3),
                             'lines': out, 'debug': dbg, 'note': note})
         except Exception as e:
@@ -1090,4 +1090,4 @@ def register(app, ytmusic):
 
     print('🔗 lyric_sync_addon v6: /search_songs /fetch_lyrics /sync_lyrics '
           '/web_lyrics registered '
-          '(yt-dlp + YTMusic + LRCLIB + web-scrape/paste align; Whisper DIHAPUS)')
+          '(yt-dlp + YTMusic + LRCLIB + web-scrape/paste align; Whisper REMOVED)')
