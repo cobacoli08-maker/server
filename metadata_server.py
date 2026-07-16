@@ -985,7 +985,7 @@ AI_TIMEOUT_SEC = int(os.environ.get("AI_TIMEOUT_SEC", "25"))
 # Gemini/NVIDIA/OpenRouter are backups if the two fast ones are rate-limited/down.
 AI_PROVIDERS = [
     {"name": "groq",       "base": "https://api.groq.com/openai/v1/chat/completions",
-     "key_envs": ["GROQ_API_KEY"],       "model_env": "GROQ_MODEL",       "default_models": ["qwen3.6-27b"]},
+     "key_envs": ["GROQ_API_KEY"],       "model_env": "GROQ_MODEL",       "default_models": ["qwen/qwen3.6-27b", "qwen/qwen3-32b"]},
     # --- cerebras DISABLED (bad AI Space output). Re-enable = uncomment these 2 lines. ---
     # {"name": "cerebras",   "base": "https://api.cerebras.ai/v1/chat/completions",
     #  "key_envs": ["CEREBRAS_API_KEY"],   "model_env": "CEREBRAS_MODEL",   "default_models": ["gpt-oss-120b", "zai-glm-4.7", "gemma-4-31b"]},
