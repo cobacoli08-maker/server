@@ -82,7 +82,7 @@ def _save_db(db):
         pass
     with open(DB_PATH, "w", encoding="utf-8") as f:
         json.dump(db, f, ensure_ascii=False, indent=2)
-    ok = [v for v in db["items"].values() if v.get("status") == "ok"]
+    ok = [v for v in db["items"].values() if v.get("status") in ("ok", "pending")]
     ok.sort(key=lambda x: x.get("created") or "", reverse=True)
     try:
         with open(PUBLIC_SNAPSHOT, "w", encoding="utf-8") as f:
@@ -464,7 +464,7 @@ def register(app, roblox_cookie=None):
         show_all = request.args.get("all") in ("1", "true", "yes")
         items = list(db["items"].values())
         if not show_all:
-            items = [v for v in items if v.get("status") == "ok"]
+            items = [v for v in items if v.get("status") in ("ok", "pending")]
         items.sort(key=lambda x: (x.get("created") or "", x.get("addedAt") or 0), reverse=True)
         return jsonify({"items": items, "updatedAt": db.get("updatedAt", 0),
                         "totalStored": len(db["items"]),
