@@ -9,6 +9,7 @@ import time
 import requests
 import re
 import difflib
+import threading
 
 # ── .env loader (for LOCAL TESTING) ─────────────────────────────────────
 # If there is a `.env` file in the same folder, read KEY=VALUE into os.environ.
@@ -953,13 +954,24 @@ def cari_anime():
             reverse=True,
         )
 
-        best = _build_anime_from_anisong(ranked[0])
-        best["match_score"] = round(_anisong_score(ranked[0], queries), 3)
+        try:
+            selected_index = int(data.get("candidate_index", 0) or 0)
+        except (TypeError, ValueError):
+            selected_index = 0
+        selected_index = max(0, min(selected_index, min(len(ranked), 8) - 1))
+        selected_item = ranked[selected_index]
+
+        best = _build_anime_from_anisong(selected_item)
+        best["match_score"] = round(_anisong_score(selected_item, queries), 3)
         best["query_romaji"] = romaji_q
+        best["candidate_index"] = selected_index
 
         candidates = []
-        for it in ranked[1:8]:
+        for idx, it in enumerate(ranked[:8]):
+            if idx == selected_index:
+                continue
             candidates.append({
+                "candidate_index": idx,
                 "anime_title": it.get("animeENName", "") or it.get("animeJPName", ""),
                 "song_title": it.get("songName", ""),
                 "theme_type": _anisong_type_short(it.get("songType", "")),
@@ -972,6 +984,175 @@ def cari_anime():
 
     except Exception as exc:
         return jsonify({"error": str(exc)}), 500
+
+
+
+# VOCADB HUNTER: curated Vocaloid metadata search/detail
+# Public read-only API. Responses are cached to avoid repeated external calls
+# when multiple moderators search the same song concurrently.
+VOCADB_BASE = "https://vocadb.net/api"
+VOCADB_HEADERS = {"User-Agent": "KaraokeStudio-DataHunter/1.0"}
+_VOCADB_CACHE = {}
+_VOCADB_CACHE_LOCK = threading.RLock()
+
+
+def _voca_cache_get(key):
+    with _VOCADB_CACHE_LOCK:
+        row = _VOCADB_CACHE.get(key)
+        if row and row[0] > time.time():
+            return row[1]
+        if row:
+            _VOCADB_CACHE.pop(key, None)
+    return None
+
+
+def _voca_cache_set(key, value, ttl):
+    with _VOCADB_CACHE_LOCK:
+        _VOCADB_CACHE[key] = (time.time() + ttl, value)
+        if len(_VOCADB_CACHE) > 500:
+            now = time.time()
+            for k, v in list(_VOCADB_CACHE.items()):
+                if v[0] <= now:
+                    _VOCADB_CACHE.pop(k, None)
+    return value
+
+
+def _voca_seconds(value):
+    try:
+        n = int(value or 0)
+        return "%d:%02d" % (n // 60, n % 60) if n else ""
+    except Exception:
+        return ""
+
+
+def _voca_picture(obj):
+    pic = obj.get("mainPicture") or {}
+    return obj.get("thumbUrl") or pic.get("urlThumb") or pic.get("urlSmallThumb") or pic.get("urlOriginal") or ""
+
+
+def _voca_names(obj):
+    out = {"japanese": "", "romaji": "", "english": ""}
+    aliases = []
+    for row in obj.get("names") or []:
+        val = (row.get("value") or row.get("name") or "").strip()
+        lang = (row.get("language") or "").lower()
+        if not val:
+            continue
+        if lang in out and not out[lang]:
+            out[lang] = val
+        elif val not in aliases:
+            aliases.append(val)
+    for raw in (obj.get("additionalNames") or "").split(","):
+        val = raw.strip()
+        if val and val not in aliases and val not in out.values():
+            aliases.append(val)
+    default = obj.get("defaultName") or obj.get("name") or ""
+    dlang = (obj.get("defaultNameLanguage") or "").lower()
+    if dlang in out and not out[dlang]:
+        out[dlang] = default
+    return out, aliases
+
+
+def _voca_artist_roles(obj):
+    groups = {"producers": [], "vocalists": [], "animators": [], "other_artists": []}
+    for row in obj.get("artists") or []:
+        artist = row.get("artist") or {}
+        name = (row.get("name") or artist.get("name") or artist.get("defaultName") or "").strip()
+        if not name:
+            continue
+        role_text = " ".join(str(row.get(k) or "") for k in ("categories", "roles", "effectiveRoles", "artistCategories")).lower()
+        if any(x in role_text for x in ("vocalist", "voice synthesizer", "utau", "synthesizer")):
+            key = "vocalists"
+        elif any(x in role_text for x in ("producer", "composer", "lyricist", "arranger", "instrumentalist")):
+            key = "producers"
+        elif any(x in role_text for x in ("animator", "illustrator")):
+            key = "animators"
+        else:
+            key = "other_artists"
+        if name not in groups[key]:
+            groups[key].append(name)
+    return groups
+
+
+def _voca_normalize(obj, detail=False):
+    names, aliases = _voca_names(obj)
+    roles = _voca_artist_roles(obj)
+    albums = []
+    for row in obj.get("albums") or []:
+        album = row.get("album") or row
+        name = album.get("name") or album.get("defaultName") or ""
+        if name and name not in albums:
+            albums.append(name)
+    languages = []
+    for lang in obj.get("languages") or []:
+        val = lang.get("name") if isinstance(lang, dict) else str(lang)
+        if val and val not in languages:
+            languages.append(val)
+    artist = obj.get("artistString") or obj.get("artist") or ""
+    if not artist:
+        artist = ", ".join(roles["producers"] + roles["vocalists"] + roles["other_artists"])
+    result = {
+        "id": obj.get("id"), "name": obj.get("name") or obj.get("defaultName") or "",
+        "title_japanese": names["japanese"], "title_romaji": names["romaji"], "title_english": names["english"],
+        "aliases": aliases, "artist": artist, "song_type": obj.get("songType") or "",
+        "publish_date": obj.get("publishDate") or obj.get("releaseDate") or "",
+        "duration": _voca_seconds(obj.get("lengthSeconds")), "thumbnail": _voca_picture(obj),
+        "producers": roles["producers"], "vocalists": roles["vocalists"], "animators": roles["animators"],
+        "other_artists": roles["other_artists"], "albums": albums, "languages": languages,
+        "bpm": obj.get("bpm") or "", "url": "https://vocadb.net/S/%s" % obj.get("id"),
+    }
+    return result
+
+
+@app.get("/vocadb/search")
+def vocadb_search():
+    query = (request.args.get("q") or "").strip()
+    if not query:
+        return jsonify({"error": "Search query empty"}), 400
+    key = "search:" + query.casefold()
+    cached = _voca_cache_get(key)
+    if cached is not None:
+        return jsonify({"results": cached, "cached": True})
+    try:
+        resp = requests.get(
+            VOCADB_BASE + "/songs",
+            params={"query": query, "start": 0, "maxResults": 20, "maxEntries": 20,
+                    "nameMatchMode": "Auto", "lang": "Default",
+                    "fields": "artists,names,mainPicture,albums"},
+            headers=VOCADB_HEADERS, timeout=20,
+        )
+        if resp.status_code != 200:
+            return jsonify({"error": "VocaDB HTTP %s" % resp.status_code, "detail": resp.text[:250]}), 502
+        payload = resp.json() or {}
+        items = payload.get("items") if isinstance(payload, dict) else payload
+        results = [_voca_normalize(x) for x in (items or [])[:20] if x.get("id")]
+        _voca_cache_set(key, results, 900)
+        return jsonify({"results": results, "cached": False})
+    except Exception as exc:
+        return jsonify({"error": "VocaDB request failed", "detail": str(exc)}), 502
+
+
+@app.get("/vocadb/song/<int:song_id>")
+def vocadb_song(song_id):
+    key = "song:%d" % song_id
+    cached = _voca_cache_get(key)
+    if cached is not None:
+        return jsonify(cached)
+    try:
+        resp = requests.get(
+            VOCADB_BASE + "/songs/%d" % song_id,
+            params={"lang": "Default", "fields": "artists,names,pvs,albums,tags,mainPicture,lyrics"},
+            headers=VOCADB_HEADERS, timeout=20,
+        )
+        if resp.status_code == 404:
+            return jsonify({"error": "VocaDB song not found"}), 404
+        if resp.status_code != 200:
+            return jsonify({"error": "VocaDB HTTP %s" % resp.status_code, "detail": resp.text[:250]}), 502
+        result = _voca_normalize(resp.json() or {}, detail=True)
+        _voca_cache_set(key, result, 86400)
+        return jsonify(result)
+    except Exception as exc:
+        return jsonify({"error": "VocaDB request failed", "detail": str(exc)}), 502
 
 
 # ── AI auto-pool: stateless multi-provider fallback ("OmniRoute-lite") ──
