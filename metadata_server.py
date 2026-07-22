@@ -291,236 +291,203 @@ def _image_candidate(source,title,url,preview_url="",source_url="",subtitle="",k
     }
 
 
+def _image_terms(value):
+    return [x for x in re.findall(r"[^\W_]+",str(value or "").casefold(),flags=re.UNICODE) if len(x)>1]
+
+
+def _image_relevant(query,*values):
+    terms=_image_terms(query)
+    if not terms:return False
+    haystack=" ".join(str(x or "") for x in values).casefold()
+    compact=re.sub(r"[\W_]+","",haystack,flags=re.UNICODE)
+    query_compact=re.sub(r"[\W_]+","",str(query or "").casefold(),flags=re.UNICODE)
+    if query_compact and query_compact in compact:return True
+    matched=sum(1 for term in terms if term in haystack or term in compact)
+    return matched/len(terms)>=0.67
+
+
 def _image_search_youtube(query):
     out=[]
-    for filt,source,base_score in (("songs","YT Music",88),("videos","YouTube",92)):
-        try:
-            rows=ytmusic_ja.search(query,filter=filt,limit=12) or []
-        except Exception:
-            rows=[]
-        for index,row in enumerate(rows):
-            thumbs=row.get("thumbnails") or []
-            raw=pick_largest_thumbnail(thumbs)
-            if not raw:
-                continue
-            image=yt_square_artwork_url(raw,1080)
-            artists=", ".join(x.get("name","") for x in (row.get("artists") or []) if x.get("name"))
-            vid=row.get("videoId") or ""
-            link=("https://www.youtube.com/watch?v="+vid) if vid else "https://music.youtube.com/search?q="+requests.utils.quote(query)
-            best=max((x for x in thumbs if isinstance(x,dict)),key=lambda x:int(x.get("width") or 0)*int(x.get("height") or 0),default={})
-            item=_image_candidate(source,row.get("title"),image,raw,link,artists,
-                                  "music_artwork" if filt=="songs" else "video_thumbnail",
-                                  1080,1080,base_score-index)
-            if item:out.append(item)
+    rows=ytmusic_ja.search(query,filter="songs",limit=20) or []
+    for index,row in enumerate(rows):
+        thumbs=row.get("thumbnails") or []
+        raw=pick_largest_thumbnail(thumbs)
+        if not raw:continue
+        artists=", ".join(x.get("name","") for x in (row.get("artists") or []) if x.get("name"))
+        title=row.get("title") or ""
+        if not _image_relevant(query,title,artists):continue
+        image=yt_square_artwork_url(raw,1080)
+        vid=row.get("videoId") or ""
+        link=("https://music.youtube.com/watch?v="+vid) if vid else "https://music.youtube.com/search?q="+requests.utils.quote(query)
+        item=_image_candidate("YT Music",title,image,image,link,artists,"music_artwork",1080,1080,90-index)
+        if item:out.append(item)
     return out
 
+def _pinterest_media_images(value):
+    found=[]
+    def walk(node):
+        if isinstance(node,dict):
+            url=node.get("url")
+            if isinstance(url,str) and url.startswith(("https://","http://")):
+                found.append({"url":url,"width":int(node.get("width") or 0),"height":int(node.get("height") or 0)})
+            for child in node.values():walk(child)
+        elif isinstance(node,list):
+            for child in node:walk(child)
+    walk(value)
+    return found
 
-def _image_search_vocadb(query):
-    rows=_voca_song_search(query,25,None,None);out=[]
-    for index,row in enumerate(rows):
-        item=_voca_normalize(row);url=item.get("thumbnail")
-        candidate=_image_candidate("VocaDB",item.get("name"),url,url,item.get("url"),item.get("artist"),"song_picture",0,0,86-index)
+
+def _pinterest_original_url(url):
+    """Prefer Pinterest's original CDN variant; real dimensions are verified later."""
+    value=str(url or "").strip()
+    parsed=urlparse(value)
+    if not value or not ((parsed.hostname or "").lower()=="i.pinimg.com"):
+        return value
+    return re.sub(r"/(?:60x60|136x136|170x|222x|236x|474x|564x|600x315|736x)/","/originals/",value,count=1)
+
+
+def _image_search_pinterest(query):
+    """Self-hosted Pinterest keyword search. No external API key or request credits."""
+    try:
+        from pinscrape import Pinterest
+    except Exception as exc:
+        raise RuntimeError("pinscrape belum terpasang: %s"%exc)
+    try:
+        client=Pinterest(proxies={},sleep_time=1,user_agent=_IMAGE_USER_AGENT)
+        urls=client.search(query,40) or []
+    except Exception as exc:
+        raise RuntimeError("Pinterest self-hosted search failed: %s"%exc)
+    source_url="https://www.pinterest.com/search/pins/?q="+requests.utils.quote(query)
+    out=[];seen=set()
+    for index,raw in enumerate(urls):
+        url=_pinterest_original_url(raw)
+        if not url or url in seen:continue
+        seen.add(url)
+        candidate=_image_candidate("Pinterest",query+" · Pinterest %d"%(index+1),url,url,
+                                   source_url,"Self-hosted Pinterest search","pin",0,0,100-index)
         if candidate:out.append(candidate)
     return out
 
 
-def _image_search_anilist(query):
-    gql="""
-    query ($search: String) {
-      Page(page: 1, perPage: 12) {
-        media(search: $search, type: ANIME, sort: SEARCH_MATCH) {
-          id title { romaji english native } siteUrl bannerImage
-          coverImage { extraLarge large medium }
-        }
-      }
-    }"""
-    resp=requests.post("https://graphql.anilist.co",json={"query":gql,"variables":{"search":query}},
-                       headers={"User-Agent":_IMAGE_USER_AGENT},timeout=10)
-    if resp.status_code!=200:
-        raise RuntimeError("AniList HTTP %s"%resp.status_code)
-    rows=(((resp.json() or {}).get("data") or {}).get("Page") or {}).get("media") or []
-    out=[]
-    for index,row in enumerate(rows):
-        title=row.get("title") or {}
-        name=title.get("english") or title.get("romaji") or title.get("native") or "Anime"
-        native=title.get("native") or title.get("romaji") or ""
-        cover=row.get("coverImage") or {}
-        url=cover.get("extraLarge") or cover.get("large") or cover.get("medium")
-        cand=_image_candidate("AniList",name,url,cover.get("medium") or url,row.get("siteUrl"),native,
-                              "anime_cover",0,0,84-index)
-        if cand:out.append(cand)
-        if row.get("bannerImage"):
-            cand=_image_candidate("AniList",name+" banner",row.get("bannerImage"),row.get("bannerImage"),
-                                  row.get("siteUrl"),native,"anime_banner",0,0,72-index)
-            if cand:out.append(cand)
-    return out
+def _image_resolve_import(value):
+    value=str(value or "").strip()
+    if not value:raise ImageDebugError("IMG-IMPORT-EMPTY","Paste a direct Pinterest image URL")
+    parsed=urlparse(value);host=(parsed.hostname or "").lower()
+    if host=="pin.it" or host=="pinterest.com" or host.endswith(".pinterest.com"):
+        raise ImageDebugError("IMG-IMPORT-PIN-PAGE","Pin page URLs cannot be imported without a resolver. Open the Pin, right-click the image, then Copy image address.")
+    if not _image_host_allowed(value):
+        raise ImageDebugError("IMG-IMPORT-HOST","Only direct supported image URLs are accepted",{"url":value[:300]})
+    value=_pinterest_original_url(value)
+    return _image_candidate("Direct URL","Imported image",value,value,value,"","direct_image",0,0,100)
+
+_IMAGE_PROBE_CACHE={}
+_IMAGE_PROBE_LOCK=threading.RLock()
 
 
-def _image_search_jikan(query):
-    resp=requests.get("https://api.jikan.moe/v4/anime",params={"q":query,"limit":12,"sfw":"true"},
-                      headers={"User-Agent":_IMAGE_USER_AGENT},timeout=10)
-    if resp.status_code!=200:
-        raise RuntimeError("Jikan HTTP %s"%resp.status_code)
-    out=[]
-    for index,row in enumerate((resp.json() or {}).get("data") or []):
-        images=row.get("images") or {}
-        webp=images.get("webp") or {}
-        jpg=images.get("jpg") or {}
-        url=webp.get("large_image_url") or jpg.get("large_image_url") or webp.get("image_url") or jpg.get("image_url")
-        preview=webp.get("small_image_url") or jpg.get("small_image_url") or url
-        subtitle=row.get("title_japanese") or row.get("title_english") or ""
-        cand=_image_candidate("Jikan / MAL",row.get("title_english") or row.get("title"),url,preview,row.get("url"),
-                              subtitle,"anime_cover",0,0,78-index)
-        if cand:out.append(cand)
-    return out
+def _image_probe_dimensions(url):
+    with _IMAGE_PROBE_LOCK:
+        cached=_IMAGE_PROBE_CACHE.get(url)
+        if cached and cached[0]>time.time():return cached[1]
+    if not _image_host_allowed(url):return None
+    try:
+        response=requests.get(url,headers={"User-Agent":_IMAGE_USER_AGENT,"Accept":"image/*"},
+                              timeout=18,stream=True,allow_redirects=True)
+        if response.status_code!=200 or not _image_host_allowed(response.url):return None
+        size=0;chunks=[]
+        for chunk in response.iter_content(65536):
+            if not chunk:continue
+            size+=len(chunk)
+            if size>_IMAGE_MAX_BYTES:return None
+            chunks.append(chunk)
+        with Image.open(BytesIO(b"".join(chunks))) as image:
+            dimensions=(int(image.width),int(image.height));image.verify()
+    except Exception:
+        return None
+    with _IMAGE_PROBE_LOCK:
+        _IMAGE_PROBE_CACHE[url]=(time.time()+1800,dimensions)
+        if len(_IMAGE_PROBE_CACHE)>300:
+            for old in list(_IMAGE_PROBE_CACHE)[:60]:_IMAGE_PROBE_CACHE.pop(old,None)
+    return dimensions
 
 
-def _image_search_coverart(query):
-    resp=requests.get("https://musicbrainz.org/ws/2/release-group/",
-                      params={"query":query,"fmt":"json","limit":10},
-                      headers={"User-Agent":_IMAGE_USER_AGENT},timeout=12)
-    if resp.status_code!=200:
-        raise RuntimeError("MusicBrainz HTTP %s"%resp.status_code)
-    out=[]
-    for index,row in enumerate((resp.json() or {}).get("release-groups") or []):
-        caa=row.get("cover-art-archive") or {}
-        if not caa.get("front"):
-            continue
-        mbid=row.get("id")
-        if not mbid:continue
-        url="https://coverartarchive.org/release-group/%s/front-1200"%mbid
-        artist=", ".join(x.get("name","") for x in (row.get("artist-credit") or []) if isinstance(x,dict))
-        cand=_image_candidate("Cover Art Archive",row.get("title"),url,url,
-                              "https://musicbrainz.org/release-group/"+mbid,artist,"album_cover",1200,1200,82-index)
-        if cand:out.append(cand)
-    return out
-
-
-def _itunes_artwork_1200(url):
-    """Build Apple's documented artwork CDN variant from a Search API artwork URL."""
-    value=str(url or "").strip()
-    if not value:return ""
-    value=re.sub(r"/\d+x\d+(?:bb)?(?:-[^/.]+)?\.(jpg|png)$",r"/1200x1200bb.\1",value,flags=re.I)
-    return value.replace("http://","https://",1)
-
-
-def _image_search_itunes(query):
-    resp=requests.get("https://itunes.apple.com/search",params={
-        "term":query,"media":"music","entity":"song","limit":24,"country":"JP"
-    },headers={"User-Agent":_IMAGE_USER_AGENT},timeout=12)
-    if resp.status_code!=200:raise RuntimeError("iTunes Search HTTP %s"%resp.status_code)
-    out=[]
-    for index,row in enumerate((resp.json() or {}).get("results") or []):
-        url=_itunes_artwork_1200(row.get("artworkUrl100") or row.get("artworkUrl60"))
-        cand=_image_candidate("Apple / iTunes",row.get("trackName") or row.get("collectionName"),url,url,
-                              row.get("trackViewUrl") or row.get("collectionViewUrl"),
-                              row.get("artistName") or "","album_cover",1200,1200,96-index*.35)
-        if cand:out.append(cand)
-    return out
-
-
-def _image_search_deezer(query):
-    resp=requests.get("https://api.deezer.com/search",params={"q":query,"limit":24},
-                      headers={"User-Agent":_IMAGE_USER_AGENT},timeout=12)
-    if resp.status_code!=200:raise RuntimeError("Deezer HTTP %s"%resp.status_code)
-    payload=resp.json() or {}
-    if payload.get("error"):raise RuntimeError("Deezer: %s"%payload.get("error"))
-    out=[]
-    for index,row in enumerate(payload.get("data") or []):
-        album=row.get("album") or {};artist=row.get("artist") or {}
-        url=album.get("cover_xl") or album.get("cover_big") or album.get("cover")
-        cand=_image_candidate("Deezer",row.get("title") or album.get("title"),url,url,
-                              row.get("link") or "",artist.get("name") or "",
-                              "album_cover",1000,1000,94-index*.35)
-        if cand:out.append(cand)
-    return out
-
-
-def _image_search_wikimedia(query):
-    resp=requests.get("https://commons.wikimedia.org/w/api.php",params={
-        "action":"query","generator":"search","gsrsearch":query,"gsrnamespace":6,
-        "gsrlimit":24,"prop":"imageinfo","iiprop":"url|size|mime","iiurlwidth":1600,
-        "format":"json","origin":"*"
-    },headers={"User-Agent":_IMAGE_USER_AGENT},timeout=15)
-    if resp.status_code!=200:raise RuntimeError("Wikimedia HTTP %s"%resp.status_code)
-    pages=((resp.json() or {}).get("query") or {}).get("pages") or {}
-    out=[]
-    for index,row in enumerate(sorted(pages.values(),key=lambda x:x.get("index",999))):
-        info=(row.get("imageinfo") or [{}])[0];mime=str(info.get("mime") or "")
-        width=int(info.get("width") or 0);height=int(info.get("height") or 0)
-        if mime not in ("image/jpeg","image/png","image/webp") or min(width,height)<1080:continue
-        url=info.get("thumburl") or info.get("url");preview=info.get("thumburl") or url
-        name=re.sub(r"^File:","",row.get("title") or "",flags=re.I)
-        source_url=info.get("descriptionurl") or info.get("descriptionshorturl") or ""
-        thumb_width=int(info.get("thumbwidth") or width);thumb_height=int(info.get("thumbheight") or height)
-        cand=_image_candidate("Wikimedia Commons",name,url,preview,source_url,
-                              "%s×%s original"%(width,height),"open_licensed",
-                              thumb_width,thumb_height,80-index*.25)
-        if cand:out.append(cand)
-    return out
-
-
-def _image_search_pinterest(query):
-    """Official Pinterest API beta. Enabled only with an approved access token."""
-    token=(os.environ.get("PINTEREST_ACCESS_TOKEN") or "").strip()
-    if not token:return []
-    resp=requests.get("https://api.pinterest.com/v5/search/partner/pins",params={
-        "term":query,"country_code":os.environ.get("PINTEREST_COUNTRY_CODE","US"),
-        "locale":os.environ.get("PINTEREST_LOCALE","en-US"),"limit":25
-    },headers={"Authorization":"Bearer "+token,"Accept":"application/json",
-               "User-Agent":_IMAGE_USER_AGENT},timeout=15)
-    if resp.status_code!=200:raise RuntimeError("Pinterest API HTTP %s"%resp.status_code)
-    out=[]
-    for index,row in enumerate((resp.json() or {}).get("items") or []):
-        images=((row.get("media") or {}).get("images") or {})
-        choices=[v for v in images.values() if isinstance(v,dict) and v.get("url")]
-        best=max(choices,key=lambda x:int(x.get("width") or 0)*int(x.get("height") or 0),default={})
-        url=best.get("url") or ""
-        pin_id=str(row.get("id") or "")
-        cand=_image_candidate("Pinterest",row.get("title") or row.get("description") or "Pinterest image",
-                              url,url,("https://www.pinterest.com/pin/"+pin_id+"/") if pin_id else "",
-                              row.get("alt_text") or "","pin",
-                              best.get("width"),best.get("height"),76-index*.25)
-        if cand:out.append(cand)
-    return out
-
+def _image_verify_candidates(items):
+    """Keep only real source files with both dimensions >=1080. No upscaled/fake cards."""
+    verified=[]
+    def check(item):
+        dimensions=_image_probe_dimensions(item.get("image_url"))
+        if not dimensions:return None
+        width,height=dimensions
+        if width<1080 or height<1080:return None
+        row=dict(item);row["width"]=width;row["height"]=height;row["verified_original"]=True
+        return row
+    with ThreadPoolExecutor(max_workers=min(12,max(1,len(items)))) as pool:
+        for row in pool.map(check,items):
+            if row:verified.append(row)
+    return verified
 
 @app.get("/image/search")
 def image_search():
     request_id=_img_id("search");query=(request.args.get("q") or "").strip()
     _img_log("IMG-SEARCH-START",request_id,query=query)
     if not query:return _img_error("IMG-SEARCH-EMPTY","Search query empty",400,request_id)
-    key="image-search-debug:"+query.casefold();cached=_image_cache_get(key)
+    key="image-search-verified-v2:"+query.casefold();cached=_image_cache_get(key)
     if cached is not None:return _img_response({"results":cached,"cached":True,"source_status":[]},200,request_id)
+    # Intentionally only these two providers. Pinterest is primary; YT Music is fallback.
     providers=[
-        ("Apple / iTunes","IMG-SOURCE-ITUNES",_image_search_itunes),
-        ("Deezer","IMG-SOURCE-DEEZER",_image_search_deezer),
-        ("YouTube","IMG-SOURCE-YOUTUBE",_image_search_youtube),
-        ("VocaDB","IMG-SOURCE-VOCADB",_image_search_vocadb),
-        ("AniList","IMG-SOURCE-ANILIST",_image_search_anilist),
-        ("Jikan","IMG-SOURCE-JIKAN",_image_search_jikan),
-        ("Cover Art Archive","IMG-SOURCE-COVERART",_image_search_coverart),
-        ("Wikimedia Commons","IMG-SOURCE-WIKIMEDIA",_image_search_wikimedia),
+        ("Pinterest (self-hosted)","IMG-SOURCE-PINTEREST",_image_search_pinterest),
+        ("YT Music","IMG-SOURCE-YTMUSIC",_image_search_youtube),
     ]
-    if (os.environ.get("PINTEREST_ACCESS_TOKEN") or "").strip():
-        providers.append(("Pinterest","IMG-SOURCE-PINTEREST",_image_search_pinterest))
-    results=[];source_status=[]
+    raw_results=[];source_status=[]
     def run(provider):
         label,code,fn=provider;started=time.time()
         try:return label,fn(query),None,code,int((time.time()-started)*1000)
         except Exception as exc:return label,[],{"message":"%s: %s"%(type(exc).__name__,exc)},code,int((time.time()-started)*1000)
-    with ThreadPoolExecutor(max_workers=len(providers)) as pool:
-        for label,items,error,code,duration in pool.map(run,providers):
-            results.extend(items);status={"source":label,"ok":error is None,"code":"IMG-SOURCE-OK" if error is None else code,"count":len(items),"duration_ms":duration}
-            if error:status["error"]=error
-            source_status.append(status);_img_log(status["code"],request_id,source=label,count=len(items),duration_ms=duration,error=error)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        rows=list(pool.map(run,providers))
+    for label,items,error,code,duration in rows:
+        raw_results.extend(items)
+        status={"source":label,"ok":error is None,"code":"IMG-SOURCE-OK" if error is None else code,
+                "raw_count":len(items),"count":0,"duration_ms":duration}
+        if error:status["error"]=error
+        source_status.append(status)
+    verified=_image_verify_candidates(raw_results)
+    counts={}
+    for item in verified:counts[item.get("source")]=counts.get(item.get("source"),0)+1
+    for status in source_status:
+        status["count"]=counts.get("Pinterest",0) if status["source"].startswith("Pinterest") else counts.get(status["source"],0)
+        status["rejected_low_resolution"]=max(0,status.get("raw_count",0)-status["count"])
+        _img_log(status["code"],request_id,source=status["source"],count=status["count"],
+                 rejected=status["rejected_low_resolution"],duration_ms=status["duration_ms"],error=status.get("error"))
     dedup=[];seen=set()
-    for item in sorted(results,key=lambda x:x.get("score",0),reverse=True):
-        identity=re.sub(r"=(?:w|s)\d+(?:-[A-Za-z0-9]+)*$","",item.get("image_url","")).lower()
+    for item in sorted(verified,key=lambda x:(x.get("source")!="Pinterest",-x.get("score",0))):
+        identity=item.get("image_url","").split("?")[0].lower()
         if identity in seen:continue
         seen.add(identity);dedup.append(item)
-    dedup=dedup[:120];_image_cache_set(key,dedup,900);_img_log("IMG-SEARCH-DONE",request_id,result_count=len(dedup))
-    return _img_response({"results":dedup,"cached":False,"source_status":source_status},200,request_id)
+    dedup=dedup[:40];_image_cache_set(key,dedup,900)
+    _img_log("IMG-SEARCH-DONE",request_id,result_count=len(dedup))
+    return _img_response({"results":dedup,"cached":False,"source_status":source_status,
+                          "quality_rule":"verified original width and height >= 1080"},200,request_id)
+
+@app.post("/image/import")
+def image_import():
+    request_id=_img_id("import");data=request.get_json(silent=True) or {};value=(data.get("url") or "").strip()
+    _img_log("IMG-IMPORT-START",request_id,url=value[:300])
+    try:
+        candidate=_image_resolve_import(value)
+        dimensions=_image_probe_dimensions(candidate.get("image_url"))
+        if not dimensions:
+            return _img_error("IMG-IMPORT-DECODE","Original image could not be downloaded or decoded",400,request_id)
+        width,height=dimensions
+        if width<1080 or height<1080:
+            return _img_error("IMG-IMPORT-LOW-RES","Original image is below the required 1080 × 1080",400,request_id,
+                              {"width":width,"height":height,"required_width":1080,"required_height":1080})
+        candidate["width"]=width;candidate["height"]=height;candidate["verified_original"]=True
+        _img_log("IMG-IMPORT-DONE",request_id,width=width,height=height,source=candidate.get("source"))
+        return _img_response({"result":candidate},200,request_id)
+    except ImageDebugError as exc:
+        return _img_error(exc.code,exc.message,400,request_id,exc.details)
+    except Exception as exc:
+        return _img_error("IMG-IMPORT-ERROR","%s: %s"%(type(exc).__name__,exc),502,request_id)
 
 
 def _image_download(url,request_id="download"):

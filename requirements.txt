@@ -5,3 +5,4 @@ pykakasi
 requests
 yt-dlp
 pillow
+pinscrape==5.0.0
