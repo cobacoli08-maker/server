@@ -1178,13 +1178,17 @@ def _voca_rank(item,query):
     return score
 
 
-def _voca_song_search(query,max_results=35,artist_id=None):
+def _voca_song_search(query,max_results=35,artist_id=None,song_types=None):
+    # Only documented/stable optional components belong in fields.
+    # originalVersion is a relationship in song data, not a proven SongOptionalFields enum value.
     params={"start":0,"maxResults":max_results,"getTotalCount":"false","nameMatchMode":"Partial","lang":"Default",
-            "fields":"Artists,Names,MainPicture,Albums,OriginalVersion"}
+            "fields":"artists,names,mainPicture,albums"}
     if query:
         params["query"]=query
     if artist_id:
         params["artistId"]=int(artist_id)
+    if song_types:
+        params["songTypes"]=song_types
     data=_voca_get("/songs",params)
     return data if isinstance(data,list) else []
 
@@ -1195,8 +1199,36 @@ def _voca_artist_search(query):
     return data if isinstance(data,list) else []
 
 
-def _voca_song_detail_raw(song_id,fields="Artists,Names,MainPicture,Albums,OriginalVersion"):
-    return _voca_get("/songs/%d"%int(song_id),{"lang":"Default","fields":fields})
+def _voca_song_detail_raw(song_id,fields="artists,names,mainPicture,albums"):
+    params={"lang":"Default"}
+    if fields:
+        params["fields"]=fields
+    return _voca_get("/songs/%d"%int(song_id),params)
+
+
+def _voca_original_id_from_page(song_id):
+    key="original-page:%d"%int(song_id)
+    cached=_voca_cache_get(key)
+    if cached is not None:
+        return cached or None
+    try:
+        resp=requests.get("https://vocadb.net/S/%d"%int(song_id),headers=VOCADB_HEADERS,timeout=10)
+        if resp.status_code!=200:
+            return _voca_cache_set(key,0,1800) or None
+        html=resp.text or ""
+        patterns=[
+            r'["\']originalVersionId["\']\s*:\s*(\d+)',
+            r'["\']originalVersion["\']\s*:\s*\{.{0,1000}?["\']id["\']\s*:\s*(\d+)',
+            r'Original\s+version.{0,4000}?href=["\'][^"\']*/S/(\d+)',
+            r'href=["\'][^"\']*/S/(\d+)[^"\']*["\'].{0,1500}?Original\s+version',
+        ]
+        for pattern in patterns:
+            match=re.search(pattern,html,re.I|re.S)
+            if match and int(match.group(1))!=int(song_id):
+                return _voca_cache_set(key,int(match.group(1)),86400)
+    except Exception:
+        pass
+    return _voca_cache_set(key,0,1800) or None
 
 
 def _voca_rescue_originals(raw_items,max_checks=6):
@@ -1208,10 +1240,13 @@ def _voca_rescue_originals(raw_items,max_checks=6):
             if oid:
                 return obj,oid
             try:
-                detail=_voca_song_detail_raw(obj.get("id"),"OriginalVersion")
-                return obj,_voca_original_id(detail or {})
+                detail=_voca_song_detail_raw(obj.get("id"),"")
+                oid=_voca_original_id(detail or {})
             except Exception:
-                return obj,None
+                oid=None
+            if not oid:
+                oid=_voca_original_id_from_page(obj.get("id"))
+            return obj,oid
         with ThreadPoolExecutor(max_workers=min(4,len(derived))) as pool:
             details=list(pool.map(load,derived))
     original_ids=[]
@@ -1284,10 +1319,11 @@ def vocadb_search():
     include_derived=(request.args.get("includeDerived") or "0").lower() in ("1","true","yes")
     if not query:
         return jsonify({"error":"Search query empty"}),400
-    key="search:v3:%s:%s"%(query.casefold(),int(include_derived))
+    key="search:v3.1:%s:%s"%(query.casefold(),int(include_derived))
     cached=_voca_cache_get(key)
     if cached is not None:
         return jsonify({"results":cached,"cached":True,"includeDerived":include_derived})
+    warnings=[]
     try:
         direct=re.search(r"(?:vocadb\.net/(?:S|Song/Details)/)?(\d{2,})",query,re.I)
         if direct and ("vocadb" in query.lower() or query.strip().isdigit()):
@@ -1296,39 +1332,61 @@ def vocadb_search():
             words=re.findall(r"[\w\u3040-\u30ff\u3400-\u9fff-]+",query)
             first=words[0] if words else query
             suffix=" ".join(words[1:]) if len(words)>1 else ""
+
+            def optional(label,fn,*args):
+                try:
+                    return fn(*args)
+                except Exception as exc:
+                    warnings.append("%s: %s"%(label,str(exc)))
+                    return []
+
+            # The main search is stable and authoritative. Optional branches may fail independently.
+            raw=_voca_song_search(query,35,None)
             with ThreadPoolExecutor(max_workers=3) as pool:
-                fut_full=pool.submit(_voca_song_search,query,35,None)
-                fut_artist=pool.submit(_voca_artist_search,first)
-                fut_suffix=pool.submit(_voca_song_search,suffix,35,None) if suffix else None
-                raw=list(fut_full.result())
-                artists=list(fut_artist.result())
-                if fut_suffix:raw.extend(fut_suffix.result())
-            # Keep only artist matches whose translated/alias names overlap first term.
+                futures=[("artist",pool.submit(optional,"artist",_voca_artist_search,first)),
+                         ("official",pool.submit(optional,"official",_voca_song_search,query,35,None,"Original"))]
+                if suffix:
+                    futures.append(("title",pool.submit(optional,"title",_voca_song_search,suffix,35,None,None)))
+                extra={label:future.result() for label,future in futures}
+            raw.extend(extra.get("official") or [])
+            raw.extend(extra.get("title") or [])
+            artists=extra.get("artist") or []
+
             matched=[]
             fn=_voca_norm(first)
             for art in artists:
                 names,aliases=_voca_names(art)
                 text=_voca_norm(" ".join([art.get("name") or art.get("defaultName") or ""]+list(names.values())+aliases))
-                if fn and (fn in text or text in fn):matched.append(art)
+                if fn and (fn in text or text in fn):
+                    matched.append(art)
             if matched:
                 with ThreadPoolExecutor(max_workers=min(3,len(matched[:3]))) as pool:
-                    for songs in pool.map(lambda x:_voca_song_search("",100,x.get("id")),matched[:3]):raw.extend(songs)
-            raw.extend(_voca_rescue_originals(raw,6))
+                    jobs=[pool.submit(optional,"artist songs",_voca_song_search,"",100,x.get("id"),None) for x in matched[:3]]
+                    for job in jobs:
+                        raw.extend(job.result())
+            # Never let original rescue turn an otherwise valid search into HTTP 502.
+            try:
+                raw.extend(_voca_rescue_originals(raw,6))
+            except Exception as exc:
+                warnings.append("original rescue: %s"%str(exc))
 
         dedup={}
         for obj in raw:
-            if isinstance(obj,dict) and obj.get("id"):dedup[int(obj["id"])]=obj
+            if isinstance(obj,dict) and obj.get("id"):
+                dedup[int(obj["id"])]=obj
         results=[_voca_normalize(x) for x in dedup.values()]
         results.sort(key=lambda x:_voca_rank(x,query),reverse=True)
         hidden=0
         if not include_derived:
             kept=[x for x in results if x.get("badge") not in ("Cover","Remix","Remaster","Music PV")]
-            hidden=len(results)-len(kept);results=kept
+            hidden=len(results)-len(kept)
+            results=kept
         results=results[:50]
         _voca_cache_set(key,results,900)
-        return jsonify({"results":results,"cached":False,"includeDerived":include_derived,"hiddenDerived":hidden})
+        return jsonify({"results":results,"cached":False,"includeDerived":include_derived,
+                        "hiddenDerived":hidden,"warnings":warnings})
     except Exception as exc:
-        return jsonify({"error":"VocaDB request failed","detail":str(exc)}),502
+        return jsonify({"error":"VocaDB request failed","detail":str(exc),"warnings":warnings}),502
 
 
 @app.get("/vocadb/song/<int:song_id>")
@@ -1337,7 +1395,7 @@ def vocadb_song(song_id):
     cached=_voca_cache_get(key)
     if cached is not None:return jsonify(cached)
     try:
-        raw=_voca_song_detail_raw(song_id,"Artists,Names,PVs,Albums,Tags,MainPicture,Lyrics,OriginalVersion")
+        raw=_voca_song_detail_raw(song_id,"artists,names,pvs,albums,tags,mainPicture,lyrics")
         result=_voca_multilingual_artists(raw,_voca_normalize(raw))
         _voca_cache_set(key,result,86400)
         return jsonify(result)
