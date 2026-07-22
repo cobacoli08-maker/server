@@ -337,21 +337,39 @@ def _pinterest_media_images(value):
     return found
 
 
-def _pinterest_original_url(url):
-    """Prefer Pinterest's original CDN variant; real dimensions are verified later."""
+def _pinterest_url_candidates(url):
+    """Return verified-at-runtime Pinterest CDN candidates, original first."""
     value=str(url or "").strip()
     parsed=urlparse(value)
-    if not value or not ((parsed.hostname or "").lower()=="i.pinimg.com"):
-        return value
-    return re.sub(r"/(?:60x60|136x136|170x|222x|236x|474x|564x|600x315|736x)/","/originals/",value,count=1)
+    if not value or (parsed.hostname or "").lower()!="i.pinimg.com":
+        return [value] if value else []
+    # Pinterest copied-image URLs may use /control1/736x/<hash>.jpg while the
+    # corresponding original CDN shape is /originals/<hash>.jpg.
+    path=parsed.path or ""
+    canonical_path=re.sub(
+        r"^/(?:control\d+/)?(?:60x60|75x75_RS|136x136|170x|222x|236x|474x|564x|600x315|736x)/",
+        "/originals/",
+        path,
+        count=1,
+        flags=re.IGNORECASE,
+    )
+    canonical=parsed._replace(path=canonical_path).geturl()
+    out=[]
+    for candidate in (canonical,value):
+        if candidate and candidate not in out:out.append(candidate)
+    return out
 
+
+def _pinterest_original_url(url):
+    candidates=_pinterest_url_candidates(url)
+    return candidates[0] if candidates else ""
 
 def _image_search_pinterest(query):
     """Self-hosted Pinterest keyword search. No external API key or request credits."""
     try:
         from pinscrape import Pinterest
     except Exception as exc:
-        raise RuntimeError("pinscrape belum terpasang: %s"%exc)
+        raise RuntimeError("pinscrape gagal dimuat di Railway: %s"%exc)
     try:
         client=Pinterest(proxies={},sleep_time=1,user_agent=_IMAGE_USER_AGENT)
         urls=client.search(query,40) or []
@@ -365,7 +383,9 @@ def _image_search_pinterest(query):
         seen.add(url)
         candidate=_image_candidate("Pinterest",query+" · Pinterest %d"%(index+1),url,url,
                                    source_url,"Self-hosted Pinterest search","pin",0,0,100-index)
-        if candidate:out.append(candidate)
+        if candidate:
+            candidate["_candidate_urls"]=_pinterest_url_candidates(raw)
+            out.append(candidate)
     return out
 
 
@@ -377,8 +397,11 @@ def _image_resolve_import(value):
         raise ImageDebugError("IMG-IMPORT-PIN-PAGE","Pin page URLs cannot be imported without a resolver. Open the Pin, right-click the image, then Copy image address.")
     if not _image_host_allowed(value):
         raise ImageDebugError("IMG-IMPORT-HOST","Only direct supported image URLs are accepted",{"url":value[:300]})
-    value=_pinterest_original_url(value)
-    return _image_candidate("Direct URL","Imported image",value,value,value,"","direct_image",0,0,100)
+    urls=_pinterest_url_candidates(value)
+    preferred=urls[0] if urls else value
+    candidate=_image_candidate("Direct URL","Imported image",preferred,preferred,value,"","direct_image",0,0,100)
+    if candidate:candidate["_candidate_urls"]=urls
+    return candidate
 
 _IMAGE_PROBE_CACHE={}
 _IMAGE_PROBE_LOCK=threading.RLock()
@@ -410,18 +433,25 @@ def _image_probe_dimensions(url):
     return dimensions
 
 
+def _image_verified_candidate(item):
+    urls=item.get("_candidate_urls") or [item.get("image_url")]
+    for url in urls:
+        dimensions=_image_probe_dimensions(url)
+        if not dimensions:continue
+        width,height=dimensions
+        if width<1080 or height<1080:continue
+        row={key:value for key,value in item.items() if key!="_candidate_urls"}
+        row["image_url"]=url;row["preview_url"]=url
+        row["width"]=width;row["height"]=height;row["verified_original"]=True
+        return row
+    return None
+
+
 def _image_verify_candidates(items):
     """Keep only real source files with both dimensions >=1080. No upscaled/fake cards."""
     verified=[]
-    def check(item):
-        dimensions=_image_probe_dimensions(item.get("image_url"))
-        if not dimensions:return None
-        width,height=dimensions
-        if width<1080 or height<1080:return None
-        row=dict(item);row["width"]=width;row["height"]=height;row["verified_original"]=True
-        return row
     with ThreadPoolExecutor(max_workers=min(12,max(1,len(items)))) as pool:
-        for row in pool.map(check,items):
+        for row in pool.map(_image_verified_candidate,items):
             if row:verified.append(row)
     return verified
 
@@ -474,13 +504,28 @@ def image_import():
     _img_log("IMG-IMPORT-START",request_id,url=value[:300])
     try:
         candidate=_image_resolve_import(value)
-        dimensions=_image_probe_dimensions(candidate.get("image_url"))
-        if not dimensions:
-            return _img_error("IMG-IMPORT-DECODE","Original image could not be downloaded or decoded",400,request_id)
-        width,height=dimensions
-        if width<1080 or height<1080:
-            return _img_error("IMG-IMPORT-LOW-RES","Original image is below the required 1080 × 1080",400,request_id,
-                              {"width":width,"height":height,"required_width":1080,"required_height":1080})
+        attempted=[];best_low_resolution=None;selected=None
+        for candidate_url in candidate.get("_candidate_urls") or [candidate.get("image_url")]:
+            dimensions=_image_probe_dimensions(candidate_url)
+            attempt={"url":candidate_url,"decoded":bool(dimensions)}
+            if dimensions:
+                width,height=dimensions;attempt.update({"width":width,"height":height})
+                if best_low_resolution is None or width*height>best_low_resolution[0]*best_low_resolution[1]:
+                    best_low_resolution=(width,height)
+                if width>=1080 and height>=1080:
+                    selected=(candidate_url,width,height);attempted.append(attempt);break
+            attempted.append(attempt)
+        if selected is None:
+            if best_low_resolution:
+                width,height=best_low_resolution
+                return _img_error("IMG-IMPORT-LOW-RES","Original image is below the required 1080 × 1080",400,request_id,
+                                  {"width":width,"height":height,"required_width":1080,"required_height":1080,
+                                   "attempted":attempted})
+            return _img_error("IMG-IMPORT-DECODE","Original image could not be downloaded or decoded",400,request_id,
+                              {"attempted":attempted})
+        selected_url,width,height=selected
+        candidate.pop("_candidate_urls",None)
+        candidate["image_url"]=selected_url;candidate["preview_url"]=selected_url
         candidate["width"]=width;candidate["height"]=height;candidate["verified_original"]=True
         _img_log("IMG-IMPORT-DONE",request_id,width=width,height=height,source=candidate.get("source"))
         return _img_response({"result":candidate},200,request_id)
