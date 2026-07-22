@@ -10,6 +10,7 @@ import requests
 import re
 import difflib
 import threading
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 from urllib.parse import urlparse
@@ -215,6 +216,26 @@ def cari_metadata():
 # Search sources are queried independently so one failed provider never hides
 # valid results from the others.
 # -----------------------------------------------------------------------------
+class ImageDebugError(Exception):
+    def __init__(self, code, message, details=None):
+        super().__init__(message); self.code=code; self.message=message; self.details=details or {}
+
+def _img_id(prefix="img"):
+    return "%s-%s" % (prefix, uuid.uuid4().hex[:12])
+
+def _img_log(code, request_id, **data):
+    event={"time":time.strftime("%Y-%m-%dT%H:%M:%SZ",time.gmtime()),"code":code,"request_id":request_id}
+    event.update(data); print("[IMAGE_DIAG] "+json.dumps(event,ensure_ascii=False,default=str),flush=True)
+
+def _img_response(data,status,request_id):
+    body=dict(data);body["request_id"]=request_id
+    response=jsonify(body);response.status_code=status;response.headers["X-Image-Request-ID"]=request_id
+    return response
+
+def _img_error(code,message,status,request_id,details=None):
+    _img_log(code,request_id,status=status,message=message,details=details or {})
+    return _img_response({"error":message,"code":code,"details":details or {}},status,request_id)
+
 _IMAGE_CACHE = {}
 _IMAGE_CACHE_LOCK = threading.RLock()
 _IMAGE_ALLOWED_SUFFIXES = (
@@ -291,17 +312,11 @@ def _image_search_youtube(query):
 
 
 def _image_search_vocadb(query):
-    out=[]
-    try:
-        rows=_voca_song_search(query,25,None,None)
-    except Exception:
-        rows=[]
+    rows=_voca_song_search(query,25,None,None);out=[]
     for index,row in enumerate(rows):
-        item=_voca_normalize(row)
-        url=item.get("thumbnail")
-        cand=_image_candidate("VocaDB",item.get("name"),url,url,item.get("url"),item.get("artist"),
-                              "song_picture",0,0,86-index)
-        if cand:out.append(cand)
+        item=_voca_normalize(row);url=item.get("thumbnail")
+        candidate=_image_candidate("VocaDB",item.get("name"),url,url,item.get("url"),item.get("artist"),"song_picture",0,0,86-index)
+        if candidate:out.append(candidate)
     return out
 
 
@@ -379,52 +394,44 @@ def _image_search_coverart(query):
 
 @app.get("/image/search")
 def image_search():
-    query=(request.args.get("q") or "").strip()
-    if not query:return jsonify({"error":"Search query empty"}),400
-    key="image-search:"+query.casefold()
-    cached=_image_cache_get(key)
-    if cached is not None:return jsonify({"results":cached,"cached":True,"warnings":[]})
-    providers=[
-        ("YouTube",_image_search_youtube),("VocaDB",_image_search_vocadb),
-        ("AniList",_image_search_anilist),("Jikan",_image_search_jikan),
-        ("Cover Art Archive",_image_search_coverart),
-    ]
-    results=[];warnings=[]
-    def run(pair):
-        label,fn=pair
-        try:return label,fn(query),None
-        except Exception as exc:return label,[],str(exc)
+    request_id=_img_id("search");query=(request.args.get("q") or "").strip()
+    _img_log("IMG-SEARCH-START",request_id,query=query)
+    if not query:return _img_error("IMG-SEARCH-EMPTY","Search query empty",400,request_id)
+    key="image-search-debug:"+query.casefold();cached=_image_cache_get(key)
+    if cached is not None:return _img_response({"results":cached,"cached":True,"source_status":[]},200,request_id)
+    providers=[("YouTube","IMG-SOURCE-YOUTUBE",_image_search_youtube),("VocaDB","IMG-SOURCE-VOCADB",_image_search_vocadb),("AniList","IMG-SOURCE-ANILIST",_image_search_anilist),("Jikan","IMG-SOURCE-JIKAN",_image_search_jikan),("Cover Art Archive","IMG-SOURCE-COVERART",_image_search_coverart)]
+    results=[];source_status=[]
+    def run(provider):
+        label,code,fn=provider;started=time.time()
+        try:return label,fn(query),None,code,int((time.time()-started)*1000)
+        except Exception as exc:return label,[],{"message":"%s: %s"%(type(exc).__name__,exc)},code,int((time.time()-started)*1000)
     with ThreadPoolExecutor(max_workers=len(providers)) as pool:
-        for label,items,error in pool.map(run,providers):
-            results.extend(items)
-            if error:warnings.append(label+": "+error)
+        for label,items,error,code,duration in pool.map(run,providers):
+            results.extend(items);status={"source":label,"ok":error is None,"code":"IMG-SOURCE-OK" if error is None else code,"count":len(items),"duration_ms":duration}
+            if error:status["error"]=error
+            source_status.append(status);_img_log(status["code"],request_id,source=label,count=len(items),duration_ms=duration,error=error)
     dedup=[];seen=set()
     for item in sorted(results,key=lambda x:x.get("score",0),reverse=True):
-        # Strip common Google size transforms for duplicate detection only.
         identity=re.sub(r"=(?:w|s)\d+(?:-[A-Za-z0-9]+)*$","",item.get("image_url","")).lower()
         if identity in seen:continue
         seen.add(identity);dedup.append(item)
-    dedup=dedup[:60]
-    _image_cache_set(key,dedup,900)
-    return jsonify({"results":dedup,"cached":False,"warnings":warnings})
+    dedup=dedup[:60];_image_cache_set(key,dedup,900);_img_log("IMG-SEARCH-DONE",request_id,result_count=len(dedup))
+    return _img_response({"results":dedup,"cached":False,"source_status":source_status},200,request_id)
 
 
-def _image_download(url):
-    if not _image_host_allowed(url):
-        raise ValueError("Image host is not allowed")
-    resp=requests.get(url,headers={"User-Agent":_IMAGE_USER_AGENT,"Accept":"image/*"},
-                      timeout=20,stream=True,allow_redirects=True)
-    if resp.status_code!=200:
-        raise ValueError("Image download HTTP %s"%resp.status_code)
-    if not _image_host_allowed(resp.url):
-        raise ValueError("Image redirect host is not allowed")
+def _image_download(url,request_id="download"):
+    if not _image_host_allowed(url):raise ImageDebugError("IMG-RENDER-HOST","Image host is not allowed",{"url":str(url)[:300]})
+    try:resp=requests.get(url,headers={"User-Agent":_IMAGE_USER_AGENT,"Accept":"image/*"},timeout=20,stream=True,allow_redirects=True)
+    except Exception as exc:raise ImageDebugError("IMG-RENDER-NETWORK","Image download failed",{"type":type(exc).__name__,"message":str(exc)})
+    if resp.status_code!=200:raise ImageDebugError("IMG-RENDER-HTTP","Image download HTTP %s"%resp.status_code,{"http_status":resp.status_code})
+    if not _image_host_allowed(resp.url):raise ImageDebugError("IMG-RENDER-REDIRECT","Image redirected to blocked host",{"url":resp.url[:300]})
     chunks=[];size=0
     for chunk in resp.iter_content(65536):
         if not chunk:continue
         size+=len(chunk)
-        if size>_IMAGE_MAX_BYTES:raise ValueError("Image exceeds 20 MB limit")
+        if size>_IMAGE_MAX_BYTES:raise ImageDebugError("IMG-RENDER-SIZE","Image exceeds 20 MB",{"bytes":size})
         chunks.append(chunk)
-    return b"".join(chunks)
+    raw=b"".join(chunks);_img_log("IMG-RENDER-DOWNLOADED",request_id,bytes=len(raw),host=urlparse(resp.url).hostname);return raw
 
 
 def _image_square_bytes(raw,mode="crop",size=1080):
@@ -452,15 +459,18 @@ def _image_square_bytes(raw,mode="crop",size=1080):
 
 @app.get("/image/render")
 def image_render():
-    url=(request.args.get("url") or "").strip()
-    mode=(request.args.get("mode") or "crop").strip()
+    request_id=str(request.args.get("rid") or _img_id("render"))[:80];url=(request.args.get("url") or "").strip();mode=(request.args.get("mode") or "crop").strip()
     if mode not in ("crop","fit_blur","fit_black"):mode="crop"
-    if not url:return jsonify({"error":"image url required"}),400
+    _img_log("IMG-RENDER-START",request_id,mode=mode,url=url[:300])
+    if not url:return _img_error("IMG-RENDER-URL","Image URL required",400,request_id)
     try:
-        rendered=_image_square_bytes(_image_download(url),mode,1080)
-        return send_file(BytesIO(rendered),mimetype="image/jpeg",download_name="image-1080.jpg",max_age=3600)
-    except Exception as exc:
-        return jsonify({"error":str(exc)}),400
+        raw=_image_download(url,request_id)
+        try:rendered=_image_square_bytes(raw,mode,1080)
+        except Exception as exc:raise ImageDebugError("IMG-RENDER-DECODE","Image decode or resize failed",{"type":type(exc).__name__,"message":str(exc)})
+        response=send_file(BytesIO(rendered),mimetype="image/jpeg",download_name="image-1080.jpg",max_age=3600);response.headers["X-Image-Request-ID"]=request_id
+        _img_log("IMG-RENDER-DONE",request_id,bytes=len(rendered),width=1080,height=1080,mode=mode);return response
+    except ImageDebugError as exc:return _img_error(exc.code,exc.message,400,request_id,exc.details)
+    except Exception as exc:return _img_error("IMG-RENDER-UNEXPECTED","%s: %s"%(type(exc).__name__,exc),500,request_id)
 
 
 @app.post("/upload_decal")
@@ -470,13 +480,16 @@ def upload_decal():
         return jsonify({"error": "ROBLOX_COOKIE env is not set"}), 500
 
     data = request.get_json(silent=True) or {}
+    image_request_id = str(data.get("request_id") or _img_id("upload"))[:80]
+    image_debug = bool(data.get("square_mode"))
+    if image_debug: _img_log("IMG-UPLOAD-START",image_request_id,mode=data.get("square_mode"),name=str(data.get("name") or "")[:40])
     image_url = (data.get("image_url") or "").strip()
     image_b64 = (data.get("image_base64") or "").strip()
     decal_name = (data.get("name") or "Karaoke Cover").strip()[:40]
     if not image_url and not image_b64:
         return jsonify({"error": "image_url or image_base64 required"}), 400
     if image_url and data.get("square_mode") and not _image_host_allowed(image_url):
-        return jsonify({"error": "Image host is not allowed for square rendering"}), 400
+        return _img_error("IMG-UPLOAD-HOST","Image host is not allowed",400,image_request_id) if image_debug else (jsonify({"error":"Image host is not allowed"}),400)
 
     try:
         if image_b64:
@@ -490,7 +503,7 @@ def upload_decal():
             file_name = (data.get("filename") or "cover.png")
         else:
             if data.get("square_mode"):
-                img_bytes = _image_download(image_url)
+                img_bytes = _image_download(image_url,image_request_id)
                 content_type = "image/jpeg"
             else:
                 img_resp = requests.get(image_url, timeout=20)
@@ -540,7 +553,7 @@ def upload_decal():
             timeout=30,
         )
         if up_resp.status_code not in (200, 201):
-            return jsonify({"error": f"Roblox API HTTP {up_resp.status_code}", "raw": up_resp.text[:300]}), 500
+            return _img_error("IMG-UPLOAD-ROBLOX","Roblox API HTTP %s"%up_resp.status_code,502,image_request_id,{"http_status":up_resp.status_code,"body":up_resp.text[:300]}) if image_debug else (jsonify({"error":f"Roblox API HTTP {up_resp.status_code}","raw":up_resp.text[:300]}),500)
 
         op_id = up_resp.json().get("operationId")
         if not op_id:
@@ -549,7 +562,7 @@ def upload_decal():
         for _ in range(12):
             time.sleep(2)
             poll_resp = session.get(
-                f"https://apis.roblox.com/assets/user-auth/v1/operations/{op_id}",
+                "https://apis.roblox.com/assets/user-auth/v1/operations/" + str(op_id),
                 headers={"X-CSRF-TOKEN": csrf_token},
                 timeout=15,
             )
@@ -563,13 +576,13 @@ def upload_decal():
                             decal_db_addon.register_uploaded_decal(asset_id, decal_name)
                         except Exception as _reg_e:
                             print("[upload_decal] auto-register to DB failed:", _reg_e)
-                        return jsonify({"decal_id": str(asset_id)})
-                    return jsonify({"error": "Upload done but assetId missing"}), 500
+                        return _img_response({"decal_id":str(asset_id)},200,image_request_id) if image_debug else jsonify({"decal_id":str(asset_id)})
+                    return _img_error("IMG-UPLOAD-ASSET-ID","Upload done but assetId missing",502,image_request_id) if image_debug else (jsonify({"error":"Upload done but assetId missing"}),500)
 
-        return jsonify({"error": "Timeout waiting for Roblox asset processing"}), 504
+        return _img_error("IMG-UPLOAD-TIMEOUT","Timeout waiting for Roblox asset processing",504,image_request_id,{"operation_id":str(op_id)}) if image_debug else (jsonify({"error":"Timeout waiting for Roblox asset processing"}),504)
 
     except Exception as exc:
-        return jsonify({"error": str(exc)}), 500
+        return _img_error("IMG-UPLOAD-UNEXPECTED","%s: %s"%(type(exc).__name__,exc),500,image_request_id) if image_debug else (jsonify({"error":str(exc)}),500)
 
 
 # ───────────────────────────────────────────────
