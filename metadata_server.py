@@ -10,6 +10,7 @@ import requests
 import re
 import difflib
 import threading
+from concurrent.futures import ThreadPoolExecutor
 
 # ── .env loader (for LOCAL TESTING) ─────────────────────────────────────
 # If there is a `.env` file in the same folder, read KEY=VALUE into os.environ.
@@ -582,7 +583,7 @@ def _anisongdb_search(query):
             f"{ANISONGDB_BASE}/search_request",
             json=body,
             headers={"Accept": "application/json", "Content-Type": "application/json"},
-            timeout=8,
+            timeout=25,
         )
         if r.status_code != 200:
             return [], f"HTTP {r.status_code}: {r.text[:200]}"
@@ -619,7 +620,7 @@ def _anisongdb_search_pair(artist_part, song_part):
             f"{ANISONGDB_BASE}/search_request",
             json=body,
             headers={"Accept": "application/json", "Content-Type": "application/json"},
-            timeout=8,
+            timeout=25,
         )
         if r.status_code != 200:
             return [], f"HTTP {r.status_code}: {r.text[:200]}"
@@ -873,12 +874,15 @@ def cari_anime():
     if not query:
         return jsonify({"error": "Search query empty"}), 400
 
+    # Detect an explicit "A - B" separator (e.g. "artist - song" or "song - artist").
     dash_parts = None
     halves = re.split(r"\s+-\s+", query, maxsplit=1)
     if len(halves) == 2 and halves[0].strip() and halves[1].strip():
         dash_parts = (halves[0].strip(), halves[1].strip())
 
     romaji_q = _anime_romaji_query(query)
+
+    # Strings used for fuzzy scoring (original + romaji of each meaningful part).
     queries = []
     for t in (list(dash_parts) if dash_parts else [query]):
         if t and t not in queries:
@@ -888,24 +892,18 @@ def cari_anime():
             queries.append(rq)
 
     try:
-        selected_raw = data.get("candidate_index", 0)
-        try:
-            selected_index = int(selected_raw or 0)
-        except (TypeError, ValueError):
-            selected_index = 0
-
-        # 1) AnisongDB primary. Failure is recorded, not returned immediately.
         results = []
         seen = set()
-        anisong_errors = []
+        last_err = ""
 
-        def _collect_anisong(found, err):
+        def _collect(found, err):
+            nonlocal last_err
             if err:
-                anisong_errors.append(err)
+                last_err = err
             for it in found:
                 key = it.get("annSongId")
                 if key is None:
-                    key = (it.get("animeENName"), it.get("songName"), it.get("songType"))
+                    key = id(it)
                 if key in seen:
                     continue
                 seen.add(key)
@@ -913,124 +911,87 @@ def cari_anime():
 
         if dash_parts:
             left, right = dash_parts
+            # Try both orientations so order ("artist - song" or "song - artist")
+            # doesn't matter, plus romaji variants of each side.
             variants = []
-            for x, y in ((left, right), (right, left)):
-                variants.append((x, y))
-                rx, ry = _anime_romaji_query(x), _anime_romaji_query(y)
-                if rx and ry and (rx, ry) not in variants:
-                    variants.append((rx, ry))
-            for x, y in variants:
-                _collect_anisong(*_anisongdb_search_pair(x, y))
+            for a, b in ((left, right), (right, left)):
+                variants.append((a, b))
+                ra, rb = _anime_romaji_query(a), _anime_romaji_query(b)
+                if ra and rb and (ra, rb) not in variants:
+                    variants.append((ra, rb))
+            for a, b in variants:
+                _collect(*_anisongdb_search_pair(a, b))
+            # If the dash pairing found nothing, fall back to a plain search of each side.
             if not results:
-                for q in queries:
-                    _collect_anisong(*_anisongdb_search(q))
+                for t in queries:
+                    _collect(*_anisongdb_search(t))
         else:
             for q in queries:
-                _collect_anisong(*_anisongdb_search(q))
+                _collect(*_anisongdb_search(q))
+            # Fallback: user typed "artist song" without a dash. Split the words
+            # and try each boundary as an artist/song intersection search.
             if not results:
                 for q in queries:
                     tokens = q.split()
                     if len(tokens) < 2 or len(tokens) > 5:
                         continue
                     for i in range(1, len(tokens)):
-                        left, right = " ".join(tokens[:i]), " ".join(tokens[i:])
-                        _collect_anisong(*_anisongdb_search_pair(left, right))
-                        _collect_anisong(*_anisongdb_search_pair(right, left))
+                        l = " ".join(tokens[:i])
+                        r = " ".join(tokens[i:])
+                        _collect(*_anisongdb_search_pair(l, r))
+                        _collect(*_anisongdb_search_pair(r, l))
                     if results:
                         break
 
-        if results:
-            ranked = sorted(results, key=lambda it: _anisong_score(it, queries), reverse=True)
-            limit = min(len(ranked), 8)
-            selected_index = max(0, min(selected_index, limit - 1))
-            selected_item = ranked[selected_index]
-            best = _build_anime_from_anisong(selected_item)
-            best["match_score"] = round(_anisong_score(selected_item, queries), 3)
-            best["query_romaji"] = romaji_q
-            best["candidate_index"] = selected_index
-            best["provider"] = "AnisongDB + AniList"
-            candidates = []
-            for idx, it in enumerate(ranked[:8]):
-                if idx == selected_index:
-                    continue
-                candidates.append({
-                    "candidate_index": idx,
-                    "anime_title": it.get("animeENName", "") or it.get("animeJPName", ""),
-                    "song_title": it.get("songName", ""),
-                    "theme_type": _anisong_type_short(it.get("songType", "")),
-                    "artist": _anisong_artists(it),
-                    "score": round(_anisong_score(it, queries), 3),
-                })
-            best["candidates"] = candidates
-            return jsonify(best)
+        if not results:
+            if last_err:
+                return jsonify({"error": "AnisongDB request failed", "detail": last_err}), 502
+            return jsonify({"error": "Song or anime not found"}), 404
 
-        # 2) AnimeThemes fallback. This is also used when AnisongDB is down.
-        themes = []
-        theme_seen = set()
-        theme_errors = []
-        fallback_queries = list(queries)
-        if not dash_parts:
-            tokens = query.split()
-            if 1 < len(tokens) <= 5:
-                fallback_queries.extend(t for t in tokens if len(t) >= 2)
+        # Rank every candidate by fuzzy similarity to the query (kanji + romaji)
+        ranked = sorted(
+            results,
+            key=lambda it: _anisong_score(it, queries),
+            reverse=True,
+        )
 
-        for q in fallback_queries:
-            found, err = _animethemes_search(q)
-            if err:
-                theme_errors.append(err)
-            for theme in found:
-                anime_obj = theme.get("anime") or {}
-                song_obj = theme.get("song") or {}
-                key = theme.get("id") or (anime_obj.get("slug"), song_obj.get("title"), theme.get("slug"))
-                if key in theme_seen:
-                    continue
-                theme_seen.add(key)
-                themes.append(theme)
+        try:
+            selected_index = int(data.get("candidate_index", 0) or 0)
+        except (TypeError, ValueError):
+            selected_index = 0
+        selected_index = max(0, min(selected_index, min(len(ranked), 8) - 1))
+        selected_item = ranked[selected_index]
 
-        if themes:
-            ranked = sorted(themes, key=lambda it: _anime_theme_score(it, queries), reverse=True)
-            limit = min(len(ranked), 8)
-            selected_index = max(0, min(selected_index, limit - 1))
-            selected_item = ranked[selected_index]
-            best = _build_anime_info(selected_item)
-            best["match_score"] = round(_anime_theme_score(selected_item, queries), 3)
-            best["query_romaji"] = romaji_q
-            best["candidate_index"] = selected_index
-            best["provider"] = "AnimeThemes + AniList"
-            best["upstream_warning"] = anisong_errors[-1] if anisong_errors else ""
-            candidates = []
-            for idx, theme in enumerate(ranked[:8]):
-                if idx == selected_index:
-                    continue
-                anime_obj = theme.get("anime") or {}
-                song_obj = theme.get("song") or {}
-                artists = song_obj.get("artists") or []
-                candidates.append({
-                    "candidate_index": idx,
-                    "anime_title": anime_obj.get("name", ""),
-                    "song_title": song_obj.get("title", ""),
-                    "theme_type": theme.get("slug") or theme.get("type") or "",
-                    "artist": ", ".join(x.get("name", "") for x in artists if x.get("name")),
-                    "year": anime_obj.get("year"),
-                    "score": round(_anime_theme_score(theme, queries), 3),
-                })
-            best["candidates"] = candidates
-            return jsonify(best)
+        best = _build_anime_from_anisong(selected_item)
+        best["match_score"] = round(_anisong_score(selected_item, queries), 3)
+        best["query_romaji"] = romaji_q
+        best["candidate_index"] = selected_index
 
-        detail = {"anisongdb": anisong_errors[-1] if anisong_errors else "no results",
-                  "animethemes": theme_errors[-1] if theme_errors else "no results"}
-        if anisong_errors or theme_errors:
-            return jsonify({"error": "Anime sources unavailable or returned no results", "detail": detail}), 502
-        return jsonify({"error": "Song or anime not found", "detail": detail}), 404
+        candidates = []
+        for idx, it in enumerate(ranked[:8]):
+            if idx == selected_index:
+                continue
+            candidates.append({
+                "candidate_index": idx,
+                "anime_title": it.get("animeENName", "") or it.get("animeJPName", ""),
+                "song_title": it.get("songName", ""),
+                "theme_type": _anisong_type_short(it.get("songType", "")),
+                "artist": _anisong_artists(it),
+                "score": round(_anisong_score(it, queries), 3),
+            })
+
+        best["candidates"] = candidates
+        return jsonify(best)
 
     except Exception as exc:
         return jsonify({"error": str(exc)}), 500
 
 
-# VOCADB HUNTER: curated Vocaloid metadata search/detail
-# Multi-path search: direct song names/aliases + artists -> their songs.
+
+# VOCADB HUNTER V3: official-first search, originalVersion rescue,
+# artist-name enrichment and cached detail lookups.
 VOCADB_BASE = "https://vocadb.net/api"
-VOCADB_HEADERS = {"User-Agent": "KaraokeStudio-DataHunter/2.0"}
+VOCADB_HEADERS = {"User-Agent": "KaraokeStudio-DataHunter/3.0"}
 _VOCADB_CACHE = {}
 _VOCADB_CACHE_LOCK = threading.RLock()
 
@@ -1048,7 +1009,7 @@ def _voca_cache_get(key):
 def _voca_cache_set(key, value, ttl):
     with _VOCADB_CACHE_LOCK:
         _VOCADB_CACHE[key] = (time.time() + ttl, value)
-        if len(_VOCADB_CACHE) > 500:
+        if len(_VOCADB_CACHE) > 600:
             now = time.time()
             for k, v in list(_VOCADB_CACHE.items()):
                 if v[0] <= now:
@@ -1056,77 +1017,87 @@ def _voca_cache_set(key, value, ttl):
     return value
 
 
+def _voca_get(path, params=None):
+    resp = requests.get(VOCADB_BASE + path, params=params or {}, headers=VOCADB_HEADERS, timeout=12)
+    if resp.status_code != 200:
+        raise RuntimeError("VocaDB %s HTTP %s: %s" % (path, resp.status_code, resp.text[:180]))
+    payload = resp.json() or {}
+    if isinstance(payload, dict) and "items" in payload:
+        return payload.get("items") or []
+    return payload
+
+
 def _voca_seconds(value):
     try:
-        n = int(value or 0)
-        return "%d:%02d" % (n // 60, n % 60) if n else ""
+        n=int(value or 0)
+        return "%d:%02d"%(n//60,n%60) if n else ""
     except Exception:
         return ""
 
 
 def _voca_picture(obj):
-    pic = obj.get("mainPicture") or {}
+    pic=obj.get("mainPicture") or {}
     return obj.get("thumbUrl") or pic.get("urlThumb") or pic.get("urlSmallThumb") or pic.get("urlOriginal") or ""
 
 
 def _voca_names(obj):
-    out = {"japanese": "", "romaji": "", "english": ""}
-    aliases = []
+    out={"japanese":"","romaji":"","english":""}
+    aliases=[]
     for row in obj.get("names") or []:
-        val = (row.get("value") or row.get("name") or "").strip()
-        lang = (row.get("language") or "").lower()
+        val=(row.get("value") or row.get("name") or "").strip()
+        lang=(row.get("language") or "").lower()
         if not val:
             continue
         if lang in out and not out[lang]:
-            out[lang] = val
+            out[lang]=val
         elif val not in aliases and val not in out.values():
             aliases.append(val)
-    additional = obj.get("additionalNames") or ""
-    if isinstance(additional, list):
-        additional = ",".join(str(x) for x in additional)
+    additional=obj.get("additionalNames") or ""
+    if isinstance(additional,list):
+        additional=",".join(str(x) for x in additional)
     for raw in str(additional).split(","):
-        val = raw.strip()
+        val=raw.strip()
         if val and val not in aliases and val not in out.values():
             aliases.append(val)
-    default = obj.get("defaultName") or obj.get("name") or ""
-    dlang = (obj.get("defaultNameLanguage") or "").lower()
+    default=obj.get("defaultName") or obj.get("name") or ""
+    dlang=(obj.get("defaultNameLanguage") or "").lower()
     if dlang in out and not out[dlang]:
-        out[dlang] = default
+        out[dlang]=default
     if default and default not in aliases and default not in out.values():
         aliases.append(default)
-    return out, aliases
+    return out,aliases
+
+
+def _voca_role_key(row):
+    role=" ".join(str(row.get(k) or "") for k in ("categories","roles","effectiveRoles","artistCategories")).lower()
+    if any(x in role for x in ("vocalist","voice synthesizer","utau","synthesizer")):
+        return "vocalists"
+    if any(x in role for x in ("producer","composer","lyricist","arranger","instrumentalist")):
+        return "producers"
+    if any(x in role for x in ("animator","illustrator")):
+        return "animators"
+    return "other_artists"
 
 
 def _voca_artist_roles(obj):
-    groups = {"producers": [], "vocalists": [], "animators": [], "other_artists": []}
+    groups={"producers":[],"vocalists":[],"animators":[],"other_artists":[]}
     for row in obj.get("artists") or []:
-        artist = row.get("artist") or {}
-        name = (row.get("name") or artist.get("name") or artist.get("defaultName") or "").strip()
-        if not name:
-            continue
-        role_text = " ".join(str(row.get(k) or "") for k in ("categories", "roles", "effectiveRoles", "artistCategories")).lower()
-        if any(x in role_text for x in ("vocalist", "voice synthesizer", "utau", "synthesizer")):
-            key = "vocalists"
-        elif any(x in role_text for x in ("producer", "composer", "lyricist", "arranger", "instrumentalist")):
-            key = "producers"
-        elif any(x in role_text for x in ("animator", "illustrator")):
-            key = "animators"
-        else:
-            key = "other_artists"
-        if name not in groups[key]:
-            groups[key].append(name)
+        artist=row.get("artist") or {}
+        name=(row.get("name") or artist.get("name") or artist.get("defaultName") or "").strip()
+        if name and name not in groups[_voca_role_key(row)]:
+            groups[_voca_role_key(row)].append(name)
     return groups
 
 
 def _voca_badge(song_type):
-    value = (song_type or "").strip()
-    low = value.lower().replace(" ", "")
-    if low in ("original", "originalsong"):
+    value=(song_type or "").strip()
+    low=value.lower().replace(" ","")
+    if low in ("original","originalsong"):
         return "Official"
-    if "remix" in low or "mashup" in low:
-        return "Remix"
     if "remaster" in low:
         return "Remaster"
+    if "remix" in low or "mashup" in low:
+        return "Remix"
     if "cover" in low:
         return "Cover"
     if "musicpv" in low:
@@ -1134,42 +1105,49 @@ def _voca_badge(song_type):
     return value or "Song"
 
 
-def _voca_type_priority(song_type):
-    badge = _voca_badge(song_type)
-    return {"Official": 6, "Remaster": 5, "Music PV": 4, "Remix": 2, "Cover": 1}.get(badge, 3)
+def _voca_original_id(obj):
+    original=obj.get("originalVersion") or obj.get("originalSong") or {}
+    if isinstance(original,dict) and original.get("id"):
+        return int(original["id"])
+    for key in ("originalVersionId","originalSongId","parentSongId"):
+        try:
+            if obj.get(key):
+                return int(obj[key])
+        except Exception:
+            pass
+    return None
 
 
-def _voca_normalize(obj, detail=False):
-    names, aliases = _voca_names(obj)
-    roles = _voca_artist_roles(obj)
-    albums = []
+def _voca_normalize(obj):
+    names,aliases=_voca_names(obj)
+    roles=_voca_artist_roles(obj)
+    albums=[]
     for row in obj.get("albums") or []:
-        album = row.get("album") or row
-        name = album.get("name") or album.get("defaultName") or ""
+        album=row.get("album") or row
+        name=album.get("name") or album.get("defaultName") or ""
         if name and name not in albums:
             albums.append(name)
-    languages = []
+    languages=[]
     for lang in obj.get("languages") or []:
-        val = lang.get("name") if isinstance(lang, dict) else str(lang)
+        val=lang.get("name") if isinstance(lang,dict) else str(lang)
         if val and val not in languages:
             languages.append(val)
-    artist = obj.get("artistString") or obj.get("artist") or ""
+    artist=obj.get("artistString") or obj.get("artist") or ""
     if not artist:
-        artist = ", ".join(roles["producers"] + roles["vocalists"] + roles["other_artists"])
-    song_type = obj.get("songType") or ""
-    rating = obj.get("ratingScore") or obj.get("favoritedTimes") or 0
-    result = {
-        "id": obj.get("id"), "name": obj.get("name") or obj.get("defaultName") or "",
-        "title_japanese": names["japanese"], "title_romaji": names["romaji"], "title_english": names["english"],
-        "aliases": aliases, "artist": artist, "song_type": song_type, "badge": _voca_badge(song_type),
-        "publish_date": obj.get("publishDate") or obj.get("releaseDate") or "",
-        "duration": _voca_seconds(obj.get("lengthSeconds")), "thumbnail": _voca_picture(obj),
-        "producers": roles["producers"], "vocalists": roles["vocalists"], "animators": roles["animators"],
-        "other_artists": roles["other_artists"], "albums": albums, "languages": languages,
-        "bpm": obj.get("bpm") or "", "rating_score": rating,
-        "url": "https://vocadb.net/S/%s" % obj.get("id"),
+        artist=", ".join(roles["producers"]+roles["vocalists"]+roles["other_artists"])
+    song_type=obj.get("songType") or ""
+    return {
+        "id":obj.get("id"),"name":obj.get("name") or obj.get("defaultName") or "",
+        "title_japanese":names["japanese"],"title_romaji":names["romaji"],"title_english":names["english"],
+        "aliases":aliases,"artist":artist,"song_type":song_type,"badge":_voca_badge(song_type),
+        "original_version_id":_voca_original_id(obj),
+        "publish_date":obj.get("publishDate") or obj.get("releaseDate") or "",
+        "duration":_voca_seconds(obj.get("lengthSeconds")),"thumbnail":_voca_picture(obj),
+        "producers":roles["producers"],"vocalists":roles["vocalists"],"animators":roles["animators"],
+        "other_artists":roles["other_artists"],"albums":albums,"languages":languages,
+        "bpm":obj.get("bpm") or "","rating_score":obj.get("ratingScore") or 0,
+        "url":"https://vocadb.net/S/%s"%obj.get("id"),
     }
-    return result
 
 
 def _voca_norm(value):
@@ -1177,183 +1155,194 @@ def _voca_norm(value):
 
 
 def _voca_tokens(value):
-    return [_voca_norm(x) for x in re.findall(r"[\w\u3040-\u30ff\u3400-\u9fff]+", str(value or "").lower()) if _voca_norm(x)]
+    return [_voca_norm(x) for x in re.findall(r"[\w\u3040-\u30ff\u3400-\u9fff]+",str(value or "").lower()) if _voca_norm(x)]
 
 
-def _voca_result_names(item):
-    values = [item.get("name"), item.get("title_japanese"), item.get("title_romaji"), item.get("title_english")]
-    values.extend(item.get("aliases") or [])
-    return [x for x in values if x]
-
-
-def _voca_rank(item, query, matched_artist_ids=None):
-    matched_artist_ids = matched_artist_ids or set()
-    qnorm = _voca_norm(query)
-    qtokens = _voca_tokens(query)
-    names = [_voca_norm(x) for x in _voca_result_names(item)]
-    artist_norm = _voca_norm(item.get("artist"))
-    combined = " ".join(names + [artist_norm])
-    exact_title = bool(qnorm and qnorm in names)
-    title_contains = max((min(len(qnorm), len(n)) / max(len(qnorm), len(n)) for n in names if qnorm and (qnorm in n or n in qnorm)), default=0)
-    coverage = sum(1 for t in qtokens if t and t in combined) / max(1, len(qtokens))
-    artist_exact = bool(qnorm and artist_norm and (qnorm == artist_norm or qnorm in artist_norm))
-    score = 0.0
-    if exact_title:
-        score += 1000
-    score += title_contains * 350
-    score += coverage * 500
-    if artist_exact:
-        score += 300
-    score += _voca_type_priority(item.get("song_type")) * 20
+def _voca_rank(item,query):
+    qn=_voca_norm(query)
+    tokens=_voca_tokens(query)
+    names=[_voca_norm(x) for x in [item.get("name"),item.get("title_japanese"),item.get("title_romaji"),item.get("title_english")]+(item.get("aliases") or []) if x]
+    artist=_voca_norm(item.get("artist"))
+    combined=" ".join(names+[artist])
+    score=0.0
+    if qn and qn in names:
+        score+=1000
+    if qn:
+        score+=max((min(len(qn),len(n))/max(len(qn),len(n)) for n in names if qn in n or n in qn),default=0)*350
+    score+=(sum(1 for t in tokens if t in combined)/max(1,len(tokens)))*500
+    score+={"Official":180,"Remaster":120,"Music PV":80,"Song":50,"Remix":10,"Cover":0}.get(item.get("badge"),30)
     try:
-        score += min(float(item.get("rating_score") or 0), 1000) / 100
+        score+=min(float(item.get("rating_score") or 0),1000)/100
     except Exception:
         pass
     return score
 
 
-def _voca_get(path, params):
-    resp = requests.get(VOCADB_BASE + path, params=params, headers=VOCADB_HEADERS, timeout=20)
-    if resp.status_code != 200:
-        raise RuntimeError("VocaDB %s HTTP %s: %s" % (path, resp.status_code, resp.text[:200]))
-    payload = resp.json() or {}
-    return payload.get("items") if isinstance(payload, dict) and "items" in payload else payload
-
-
-def _voca_song_search(query, artist_id=None, max_results=50):
-    params = {
-        "start": 0, "maxResults": max_results, "getTotalCount": "false",
-        "nameMatchMode": "Partial", "lang": "Default",
-        "fields": "Artists,Names,MainPicture,Albums",
-    }
+def _voca_song_search(query,max_results=35,artist_id=None):
+    params={"start":0,"maxResults":max_results,"getTotalCount":"false","nameMatchMode":"Partial","lang":"Default",
+            "fields":"Artists,Names,MainPicture,Albums,OriginalVersion"}
     if query:
-        params["query"] = query
+        params["query"]=query
     if artist_id:
-        params["artistId"] = int(artist_id)
-    data = _voca_get("/songs", params)
-    return data if isinstance(data, list) else []
+        params["artistId"]=int(artist_id)
+    data=_voca_get("/songs",params)
+    return data if isinstance(data,list) else []
 
 
-def _voca_artist_search(query, max_results=10):
-    data = _voca_get("/artists", {
-        "query": query, "start": 0, "maxResults": max_results,
-        "getTotalCount": "false", "nameMatchMode": "Partial", "lang": "Default",
-        "fields": "Names,MainPicture,AdditionalNames",
-    })
-    return data if isinstance(data, list) else []
+def _voca_artist_search(query):
+    data=_voca_get("/artists",{"query":query,"start":0,"maxResults":8,"getTotalCount":"false",
+                               "nameMatchMode":"Partial","lang":"Default","fields":"Names,MainPicture"})
+    return data if isinstance(data,list) else []
+
+
+def _voca_song_detail_raw(song_id,fields="Artists,Names,MainPicture,Albums,OriginalVersion"):
+    return _voca_get("/songs/%d"%int(song_id),{"lang":"Default","fields":fields})
+
+
+def _voca_rescue_originals(raw_items,max_checks=6):
+    derived=[x for x in raw_items if _voca_badge(x.get("songType")) in ("Cover","Remix","Remaster","Music PV")][0:max_checks]
+    details=[]
+    if derived:
+        def load(obj):
+            oid=_voca_original_id(obj)
+            if oid:
+                return obj,oid
+            try:
+                detail=_voca_song_detail_raw(obj.get("id"),"OriginalVersion")
+                return obj,_voca_original_id(detail or {})
+            except Exception:
+                return obj,None
+        with ThreadPoolExecutor(max_workers=min(4,len(derived))) as pool:
+            details=list(pool.map(load,derived))
+    original_ids=[]
+    for _,oid in details:
+        if oid and oid not in original_ids:
+            original_ids.append(oid)
+    if not original_ids:
+        return []
+    def fetch(oid):
+        try:
+            return _voca_song_detail_raw(oid)
+        except Exception:
+            return None
+    with ThreadPoolExecutor(max_workers=min(4,len(original_ids))) as pool:
+        return [x for x in pool.map(fetch,original_ids) if isinstance(x,dict) and x.get("id")]
+
+
+def _voca_artist_detail(artist_id):
+    key="artist:%d"%int(artist_id)
+    cached=_voca_cache_get(key)
+    if cached is not None:
+        return cached
+    data=_voca_get("/artists/%d"%int(artist_id),{"lang":"Default","fields":"Names,MainPicture"})
+    names,aliases=_voca_names(data or {})
+    japanese=names.get("japanese") or data.get("name") or data.get("defaultName") or ""
+    latin=names.get("english") or names.get("romaji") or ""
+    if not latin:
+        latin=next((x for x in aliases if re.search(r"[A-Za-z]",x)),"")
+    display=japanese+(" - "+latin if latin and _voca_norm(latin)!=_voca_norm(japanese) else "")
+    result={"id":artist_id,"japanese":japanese,"romaji":names.get("romaji") or "","english":names.get("english") or "","display":display or latin}
+    return _voca_cache_set(key,result,86400)
+
+
+def _voca_multilingual_artists(obj,result):
+    jobs=[]
+    for row in obj.get("artists") or []:
+        artist=row.get("artist") or {}
+        aid=artist.get("id") or row.get("artistId")
+        if aid and _voca_role_key(row) in ("producers","vocalists"):
+            jobs.append((int(aid),_voca_role_key(row)))
+    unique=[]
+    seen=set()
+    for job in jobs:
+        if job not in seen:
+            seen.add(job);unique.append(job)
+    details={"producers":[],"vocalists":[]}
+    if unique:
+        def load(job):
+            try:return job[1],_voca_artist_detail(job[0])
+            except Exception:return job[1],None
+        with ThreadPoolExecutor(max_workers=min(4,len(unique))) as pool:
+            for role,item in pool.map(load,unique):
+                if item:details[role].append(item)
+    result["producer_details"]=details["producers"]
+    result["vocalist_details"]=details["vocalists"]
+    prod=[x.get("display") for x in details["producers"] if x.get("display")]
+    voc=[x.get("display") for x in details["vocalists"] if x.get("display")]
+    if prod and voc:
+        result["artist_display_multilingual"]=" feat. ".join([", ".join(prod),", ".join(voc)])
+    elif prod or voc:
+        result["artist_display_multilingual"]=", ".join(prod+voc)
+    else:
+        result["artist_display_multilingual"]=result.get("artist") or ""
+    return result
 
 
 @app.get("/vocadb/search")
 def vocadb_search():
-    query = (request.args.get("q") or "").strip()
+    query=(request.args.get("q") or "").strip()
+    include_derived=(request.args.get("includeDerived") or "0").lower() in ("1","true","yes")
     if not query:
-        return jsonify({"error": "Search query empty"}), 400
-    key = "search:v2:" + query.casefold()
-    cached = _voca_cache_get(key)
+        return jsonify({"error":"Search query empty"}),400
+    key="search:v3:%s:%s"%(query.casefold(),int(include_derived))
+    cached=_voca_cache_get(key)
     if cached is not None:
-        return jsonify({"results": cached, "cached": True, "strategy": "title+aliases+artist"})
-
+        return jsonify({"results":cached,"cached":True,"includeDerived":include_derived})
     try:
-        # Direct VocaDB song URL or raw ID is always supported.
-        direct = re.search(r"(?:vocadb\.net/(?:S|Song/Details)/)?(\d{2,})", query, re.I)
+        direct=re.search(r"(?:vocadb\.net/(?:S|Song/Details)/)?(\d{2,})",query,re.I)
         if direct and ("vocadb" in query.lower() or query.strip().isdigit()):
-            song_id = int(direct.group(1))
-            detail = _voca_get("/songs/%d" % song_id, {"lang": "Default", "fields": "Artists,Names,MainPicture,Albums"})
-            item = _voca_normalize(detail or {})
-            results = [item] if item.get("id") else []
-            _voca_cache_set(key, results, 900)
-            return jsonify({"results": results, "cached": False, "strategy": "direct-id"})
+            raw=[_voca_song_detail_raw(int(direct.group(1)))]
+        else:
+            words=re.findall(r"[\w\u3040-\u30ff\u3400-\u9fff-]+",query)
+            first=words[0] if words else query
+            suffix=" ".join(words[1:]) if len(words)>1 else ""
+            with ThreadPoolExecutor(max_workers=3) as pool:
+                fut_full=pool.submit(_voca_song_search,query,35,None)
+                fut_artist=pool.submit(_voca_artist_search,first)
+                fut_suffix=pool.submit(_voca_song_search,suffix,35,None) if suffix else None
+                raw=list(fut_full.result())
+                artists=list(fut_artist.result())
+                if fut_suffix:raw.extend(fut_suffix.result())
+            # Keep only artist matches whose translated/alias names overlap first term.
+            matched=[]
+            fn=_voca_norm(first)
+            for art in artists:
+                names,aliases=_voca_names(art)
+                text=_voca_norm(" ".join([art.get("name") or art.get("defaultName") or ""]+list(names.values())+aliases))
+                if fn and (fn in text or text in fn):matched.append(art)
+            if matched:
+                with ThreadPoolExecutor(max_workers=min(3,len(matched[:3]))) as pool:
+                    for songs in pool.map(lambda x:_voca_song_search("",100,x.get("id")),matched[:3]):raw.extend(songs)
+            raw.extend(_voca_rescue_originals(raw,6))
 
-        raw_items = []
-        seen_ids = set()
-        upstream_errors = []
-
-        def add(items):
-            for obj in items or []:
-                sid = obj.get("id")
-                if not sid or sid in seen_ids:
-                    continue
-                seen_ids.add(sid)
-                raw_items.append(obj)
-
-        # Direct title/alias search: full query, then useful individual terms.
-        title_queries = [query]
-        words = re.findall(r"[\w\u3040-\u30ff\u3400-\u9fff]+", query)
-        if 1 < len(words) <= 5:
-            title_queries.extend(w for w in words if len(w) >= 3)
-        for q in dict.fromkeys(title_queries):
-            try:
-                add(_voca_song_search(q, max_results=50))
-            except Exception as exc:
-                upstream_errors.append(str(exc))
-
-        # Artist lookup supports Latin/Japanese/English aliases. For a combined
-        # query such as "masarada outlaws", each meaningful part is tested.
-        artist_queries = [query]
-        if 1 < len(words) <= 5:
-            artist_queries.extend(w for w in words if len(w) >= 3)
-            for i in range(1, len(words)):
-                artist_queries.append(" ".join(words[:i]))
-                artist_queries.append(" ".join(words[i:]))
-
-        artists = []
-        artist_seen = set()
-        for q in dict.fromkeys(artist_queries):
-            try:
-                for art in _voca_artist_search(q, 10):
-                    aid = art.get("id")
-                    if not aid or aid in artist_seen:
-                        continue
-                    # Keep only artists whose primary/translated/alias names
-                    # actually overlap this query part.
-                    anames, aaliases = _voca_names(art)
-                    text = " ".join([art.get("name") or art.get("defaultName") or ""] + list(anames.values()) + aaliases)
-                    qn = _voca_norm(q)
-                    if qn and qn not in _voca_norm(text) and _voca_norm(text) not in qn:
-                        continue
-                    artist_seen.add(aid)
-                    artists.append(art)
-            except Exception as exc:
-                upstream_errors.append(str(exc))
-
-        for art in artists[:5]:
-            try:
-                add(_voca_song_search("", artist_id=art.get("id"), max_results=100))
-            except Exception as exc:
-                upstream_errors.append(str(exc))
-
-        results = [_voca_normalize(x) for x in raw_items]
-        results.sort(key=lambda x: _voca_rank(x, query), reverse=True)
-        results = results[:50]
-        if not results and upstream_errors:
-            return jsonify({"error": "VocaDB request failed", "detail": upstream_errors[-1]}), 502
-        _voca_cache_set(key, results, 900)
-        return jsonify({"results": results, "cached": False, "strategy": "title+aliases+artist",
-                        "artistsMatched": len(artists), "upstreamWarnings": upstream_errors[-2:]})
+        dedup={}
+        for obj in raw:
+            if isinstance(obj,dict) and obj.get("id"):dedup[int(obj["id"])]=obj
+        results=[_voca_normalize(x) for x in dedup.values()]
+        results.sort(key=lambda x:_voca_rank(x,query),reverse=True)
+        hidden=0
+        if not include_derived:
+            kept=[x for x in results if x.get("badge") not in ("Cover","Remix","Remaster","Music PV")]
+            hidden=len(results)-len(kept);results=kept
+        results=results[:50]
+        _voca_cache_set(key,results,900)
+        return jsonify({"results":results,"cached":False,"includeDerived":include_derived,"hiddenDerived":hidden})
     except Exception as exc:
-        return jsonify({"error": "VocaDB request failed", "detail": str(exc)}), 502
+        return jsonify({"error":"VocaDB request failed","detail":str(exc)}),502
 
 
 @app.get("/vocadb/song/<int:song_id>")
 def vocadb_song(song_id):
-    key = "song:%d" % song_id
-    cached = _voca_cache_get(key)
-    if cached is not None:
-        return jsonify(cached)
+    key="song:v3:%d"%song_id
+    cached=_voca_cache_get(key)
+    if cached is not None:return jsonify(cached)
     try:
-        data = _voca_get("/songs/%d" % song_id,
-                         {"lang": "Default", "fields": "Artists,Names,PVs,Albums,Tags,MainPicture,Lyrics"})
-        result = _voca_normalize(data or {}, detail=True)
-        if not result.get("id"):
-            return jsonify({"error": "VocaDB song not found"}), 404
-        _voca_cache_set(key, result, 86400)
+        raw=_voca_song_detail_raw(song_id,"Artists,Names,PVs,Albums,Tags,MainPicture,Lyrics,OriginalVersion")
+        result=_voca_multilingual_artists(raw,_voca_normalize(raw))
+        _voca_cache_set(key,result,86400)
         return jsonify(result)
-    except RuntimeError as exc:
-        if "HTTP 404" in str(exc):
-            return jsonify({"error": "VocaDB song not found"}), 404
-        return jsonify({"error": "VocaDB request failed", "detail": str(exc)}), 502
     except Exception as exc:
-        return jsonify({"error": "VocaDB request failed", "detail": str(exc)}), 502
+        return jsonify({"error":"VocaDB request failed","detail":str(exc)}),502
 
 
 # ── AI auto-pool: stateless multi-provider fallback ("OmniRoute-lite") ──
