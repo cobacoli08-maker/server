@@ -79,6 +79,29 @@ def clean_title(title):
     return (title or "Unknown").split(" - ")[0].split(" (")[0].strip()
 
 
+def yt_square_artwork_url(url, size=1080):
+    """Request a square Google-hosted YT Music artwork variant without altering other hosts."""
+    value = str(url or "").strip()
+    if not value or "googleusercontent.com" not in value.lower():
+        return value
+    # YT Music artwork commonly ends in an image transformation such as
+    # =w120-h120-l90-rj. Replace only that final transform, never query values.
+    base = re.sub(r"=(?:w|s)\d+(?:-[A-Za-z0-9]+)*$", "", value)
+    return f"{base}=w{int(size)}-h{int(size)}-l90-rj"
+
+
+def pick_largest_thumbnail(thumbnails):
+    rows = [x for x in (thumbnails or []) if isinstance(x, dict) and x.get("url")]
+    if not rows:
+        return ""
+    # Prefer declared pixel area; when dimensions are absent, later YTMusic rows
+    # traditionally contain the larger variant.
+    _, best = max(enumerate(rows), key=lambda pair: (
+        int(pair[1].get("width") or 0) * int(pair[1].get("height") or 0), pair[0]
+    ))
+    return best.get("url") or ""
+
+
 @app.get("/health")
 def health():
     return jsonify({"ok": True, "service": "karaoke-metadata"})
@@ -165,10 +188,8 @@ def cari_metadata():
                 pass
 
         thumbnails = track_ja.get("thumbnails", [])
-        cover_url = ""
-        if thumbnails:
-            raw_url = thumbnails[-1]["url"]
-            cover_url = (raw_url.split("=")[0] + "=w1024-h1024") if "=" in raw_url else raw_url
+        raw_url = pick_largest_thumbnail(thumbnails)
+        cover_url = yt_square_artwork_url(raw_url, 1080)
 
         return jsonify({
             "title_kanji": raw_title_ja,

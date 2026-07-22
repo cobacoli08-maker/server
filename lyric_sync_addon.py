@@ -876,6 +876,24 @@ def _web_gap_fill(web_texts, base_lines, dbg):
     return out
 
 
+def _yt_square_artwork_url(url, size=1080):
+    value = str(url or '').strip()
+    if not value or 'googleusercontent.com' not in value.lower():
+        return value
+    base = re.sub(r"=(?:w|s)\d+(?:-[A-Za-z0-9]+)*$", '', value)
+    return '{}=w{}-h{}-l90-rj'.format(base, int(size), int(size))
+
+
+def _pick_largest_yt_thumbnail(thumbnails):
+    rows = [x for x in (thumbnails or []) if isinstance(x, dict) and x.get('url')]
+    if not rows:
+        return ''
+    _, best = max(enumerate(rows), key=lambda pair: (
+        int(pair[1].get('width') or 0) * int(pair[1].get('height') or 0), pair[0]
+    ))
+    return best.get('url') or ''
+
+
 def register(app, ytmusic):
 
     @app.route('/search_songs', methods=['POST'])
@@ -901,6 +919,7 @@ def register(app, ytmusic):
                     seen.add(v)
                     arts = it.get('artists') or []
                     thumbs = it.get('thumbnails') or []
+                    preview_thumb = _pick_largest_yt_thumbnail(thumbs)
                     out.append({
                         'videoId': v,
                         'title': it.get('title', ''),
@@ -908,7 +927,8 @@ def register(app, ytmusic):
                         'album': (it.get('album') or {}).get('name') if isinstance(it.get('album'), dict) else '',
                         'duration': it.get('duration'),
                         'resultType': it.get('resultType'),
-                        'thumbnail': thumbs[-1]['url'] if thumbs else '',
+                        'thumbnail_preview': preview_thumb,
+                        'thumbnail': _yt_square_artwork_url(preview_thumb, 1080),
                     })
             return jsonify({'results': out[:10], 'directVideoId': vid})
         except Exception as e:
