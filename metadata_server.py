@@ -1,4 +1,4 @@
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, send_file
 from flask_cors import CORS
 from ytmusicapi import YTMusic
 import pykakasi
@@ -11,6 +11,9 @@ import re
 import difflib
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from io import BytesIO
+from urllib.parse import urlparse
+from PIL import Image, ImageOps, ImageFilter
 
 # ── .env loader (for LOCAL TESTING) ─────────────────────────────────────
 # If there is a `.env` file in the same folder, read KEY=VALUE into os.environ.
@@ -207,6 +210,259 @@ def cari_metadata():
         return jsonify({"error": str(exc)}), 500
 
 
+# -----------------------------------------------------------------------------
+# IMAGE FINDER: multi-source image search + deterministic 1080x1080 renderer.
+# Search sources are queried independently so one failed provider never hides
+# valid results from the others.
+# -----------------------------------------------------------------------------
+_IMAGE_CACHE = {}
+_IMAGE_CACHE_LOCK = threading.RLock()
+_IMAGE_ALLOWED_SUFFIXES = (
+    "googleusercontent.com", "ytimg.com", "ggpht.com",
+    "vocadb.net", "anilist.co", "anilistcdn.com",
+    "myanimelist.net", "mal-cdn.net",
+    "coverartarchive.org", "archive.org",
+)
+_IMAGE_MAX_BYTES = 20 * 1024 * 1024
+_IMAGE_USER_AGENT = "KaraokeStudio-ImageFinder/1.0 (contact: app-owner)"
+
+
+def _image_cache_get(key):
+    with _IMAGE_CACHE_LOCK:
+        row=_IMAGE_CACHE.get(key)
+        if row and row[0] > time.time():
+            return row[1]
+        if row:
+            _IMAGE_CACHE.pop(key,None)
+    return None
+
+
+def _image_cache_set(key,value,ttl=900):
+    with _IMAGE_CACHE_LOCK:
+        _IMAGE_CACHE[key]=(time.time()+ttl,value)
+        if len(_IMAGE_CACHE)>120:
+            for old in list(_IMAGE_CACHE)[:30]:
+                _IMAGE_CACHE.pop(old,None)
+    return value
+
+
+def _image_host_allowed(url):
+    try:
+        parsed=urlparse(str(url or ""))
+        host=(parsed.hostname or "").lower()
+        return parsed.scheme in ("http","https") and any(host==x or host.endswith("."+x) for x in _IMAGE_ALLOWED_SUFFIXES)
+    except Exception:
+        return False
+
+
+def _image_candidate(source,title,url,preview_url="",source_url="",subtitle="",kind="artwork",width=0,height=0,score=0):
+    if not url or not _image_host_allowed(url):
+        return None
+    return {
+        "source":source,"title":str(title or "Untitled"),"subtitle":str(subtitle or ""),
+        "image_url":str(url),"preview_url":str(preview_url or url),
+        "source_url":str(source_url or url),"kind":kind,
+        "width":int(width or 0),"height":int(height or 0),"score":float(score or 0),
+    }
+
+
+def _image_search_youtube(query):
+    out=[]
+    for filt,source,base_score in (("songs","YT Music",88),("videos","YouTube",92)):
+        try:
+            rows=ytmusic_ja.search(query,filter=filt,limit=12) or []
+        except Exception:
+            rows=[]
+        for index,row in enumerate(rows):
+            thumbs=row.get("thumbnails") or []
+            raw=pick_largest_thumbnail(thumbs)
+            if not raw:
+                continue
+            image=yt_square_artwork_url(raw,1080)
+            artists=", ".join(x.get("name","") for x in (row.get("artists") or []) if x.get("name"))
+            vid=row.get("videoId") or ""
+            link=("https://www.youtube.com/watch?v="+vid) if vid else "https://music.youtube.com/search?q="+requests.utils.quote(query)
+            best=max((x for x in thumbs if isinstance(x,dict)),key=lambda x:int(x.get("width") or 0)*int(x.get("height") or 0),default={})
+            item=_image_candidate(source,row.get("title"),image,raw,link,artists,
+                                  "music_artwork" if filt=="songs" else "video_thumbnail",
+                                  best.get("width"),best.get("height"),base_score-index)
+            if item:out.append(item)
+    return out
+
+
+def _image_search_vocadb(query):
+    out=[]
+    try:
+        rows=_voca_song_search(query,25,None,None)
+    except Exception:
+        rows=[]
+    for index,row in enumerate(rows):
+        item=_voca_normalize(row)
+        url=item.get("thumbnail")
+        cand=_image_candidate("VocaDB",item.get("name"),url,url,item.get("url"),item.get("artist"),
+                              "song_picture",0,0,86-index)
+        if cand:out.append(cand)
+    return out
+
+
+def _image_search_anilist(query):
+    gql="""
+    query ($search: String) {
+      Page(page: 1, perPage: 12) {
+        media(search: $search, type: ANIME, sort: SEARCH_MATCH) {
+          id title { romaji english native } siteUrl bannerImage
+          coverImage { extraLarge large medium }
+        }
+      }
+    }"""
+    resp=requests.post("https://graphql.anilist.co",json={"query":gql,"variables":{"search":query}},
+                       headers={"User-Agent":_IMAGE_USER_AGENT},timeout=10)
+    if resp.status_code!=200:
+        raise RuntimeError("AniList HTTP %s"%resp.status_code)
+    rows=(((resp.json() or {}).get("data") or {}).get("Page") or {}).get("media") or []
+    out=[]
+    for index,row in enumerate(rows):
+        title=row.get("title") or {}
+        name=title.get("english") or title.get("romaji") or title.get("native") or "Anime"
+        native=title.get("native") or title.get("romaji") or ""
+        cover=row.get("coverImage") or {}
+        url=cover.get("extraLarge") or cover.get("large") or cover.get("medium")
+        cand=_image_candidate("AniList",name,url,cover.get("medium") or url,row.get("siteUrl"),native,
+                              "anime_cover",0,0,84-index)
+        if cand:out.append(cand)
+        if row.get("bannerImage"):
+            cand=_image_candidate("AniList",name+" banner",row.get("bannerImage"),row.get("bannerImage"),
+                                  row.get("siteUrl"),native,"anime_banner",0,0,72-index)
+            if cand:out.append(cand)
+    return out
+
+
+def _image_search_jikan(query):
+    resp=requests.get("https://api.jikan.moe/v4/anime",params={"q":query,"limit":12,"sfw":"true"},
+                      headers={"User-Agent":_IMAGE_USER_AGENT},timeout=10)
+    if resp.status_code!=200:
+        raise RuntimeError("Jikan HTTP %s"%resp.status_code)
+    out=[]
+    for index,row in enumerate((resp.json() or {}).get("data") or []):
+        images=row.get("images") or {}
+        webp=images.get("webp") or {}
+        jpg=images.get("jpg") or {}
+        url=webp.get("large_image_url") or jpg.get("large_image_url") or webp.get("image_url") or jpg.get("image_url")
+        preview=webp.get("small_image_url") or jpg.get("small_image_url") or url
+        subtitle=row.get("title_japanese") or row.get("title_english") or ""
+        cand=_image_candidate("Jikan / MAL",row.get("title_english") or row.get("title"),url,preview,row.get("url"),
+                              subtitle,"anime_cover",0,0,78-index)
+        if cand:out.append(cand)
+    return out
+
+
+def _image_search_coverart(query):
+    resp=requests.get("https://musicbrainz.org/ws/2/release-group/",
+                      params={"query":query,"fmt":"json","limit":10},
+                      headers={"User-Agent":_IMAGE_USER_AGENT},timeout=12)
+    if resp.status_code!=200:
+        raise RuntimeError("MusicBrainz HTTP %s"%resp.status_code)
+    out=[]
+    for index,row in enumerate((resp.json() or {}).get("release-groups") or []):
+        caa=row.get("cover-art-archive") or {}
+        if not caa.get("front"):
+            continue
+        mbid=row.get("id")
+        if not mbid:continue
+        url="https://coverartarchive.org/release-group/%s/front-1200"%mbid
+        artist=", ".join(x.get("name","") for x in (row.get("artist-credit") or []) if isinstance(x,dict))
+        cand=_image_candidate("Cover Art Archive",row.get("title"),url,url,
+                              "https://musicbrainz.org/release-group/"+mbid,artist,"album_cover",1200,1200,82-index)
+        if cand:out.append(cand)
+    return out
+
+
+@app.get("/image/search")
+def image_search():
+    query=(request.args.get("q") or "").strip()
+    if not query:return jsonify({"error":"Search query empty"}),400
+    key="image-search:"+query.casefold()
+    cached=_image_cache_get(key)
+    if cached is not None:return jsonify({"results":cached,"cached":True,"warnings":[]})
+    providers=[
+        ("YouTube",_image_search_youtube),("VocaDB",_image_search_vocadb),
+        ("AniList",_image_search_anilist),("Jikan",_image_search_jikan),
+        ("Cover Art Archive",_image_search_coverart),
+    ]
+    results=[];warnings=[]
+    def run(pair):
+        label,fn=pair
+        try:return label,fn(query),None
+        except Exception as exc:return label,[],str(exc)
+    with ThreadPoolExecutor(max_workers=len(providers)) as pool:
+        for label,items,error in pool.map(run,providers):
+            results.extend(items)
+            if error:warnings.append(label+": "+error)
+    dedup=[];seen=set()
+    for item in sorted(results,key=lambda x:x.get("score",0),reverse=True):
+        # Strip common Google size transforms for duplicate detection only.
+        identity=re.sub(r"=(?:w|s)\d+(?:-[A-Za-z0-9]+)*$","",item.get("image_url","")).lower()
+        if identity in seen:continue
+        seen.add(identity);dedup.append(item)
+    dedup=dedup[:60]
+    _image_cache_set(key,dedup,900)
+    return jsonify({"results":dedup,"cached":False,"warnings":warnings})
+
+
+def _image_download(url):
+    if not _image_host_allowed(url):
+        raise ValueError("Image host is not allowed")
+    resp=requests.get(url,headers={"User-Agent":_IMAGE_USER_AGENT,"Accept":"image/*"},
+                      timeout=20,stream=True,allow_redirects=True)
+    if resp.status_code!=200:
+        raise ValueError("Image download HTTP %s"%resp.status_code)
+    if not _image_host_allowed(resp.url):
+        raise ValueError("Image redirect host is not allowed")
+    chunks=[];size=0
+    for chunk in resp.iter_content(65536):
+        if not chunk:continue
+        size+=len(chunk)
+        if size>_IMAGE_MAX_BYTES:raise ValueError("Image exceeds 20 MB limit")
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def _image_square_bytes(raw,mode="crop",size=1080):
+    size=1080  # Product contract: every Image Finder output is exactly 1080 square.
+    with Image.open(BytesIO(raw)) as source:
+        source.seek(0)
+        if source.width*source.height>40000000:
+            raise ValueError("Image pixel count is too large")
+        image=source.convert("RGB")
+    if mode=="fit_blur":
+        background=ImageOps.fit(image,(size,size),method=Image.Resampling.LANCZOS)
+        background=background.filter(ImageFilter.GaussianBlur(max(18,size//35)))
+        foreground=ImageOps.contain(image,(size,size),method=Image.Resampling.LANCZOS)
+        x=(size-foreground.width)//2;y=(size-foreground.height)//2
+        background.paste(foreground,(x,y));output=background
+    elif mode=="fit_black":
+        output=Image.new("RGB",(size,size),(10,10,12))
+        foreground=ImageOps.contain(image,(size,size),method=Image.Resampling.LANCZOS)
+        output.paste(foreground,((size-foreground.width)//2,(size-foreground.height)//2))
+    else:
+        output=ImageOps.fit(image,(size,size),method=Image.Resampling.LANCZOS,centering=(0.5,0.5))
+    buf=BytesIO();output.save(buf,"JPEG",quality=94,optimize=True,progressive=True)
+    return buf.getvalue()
+
+
+@app.get("/image/render")
+def image_render():
+    url=(request.args.get("url") or "").strip()
+    mode=(request.args.get("mode") or "crop").strip()
+    if mode not in ("crop","fit_blur","fit_black"):mode="crop"
+    if not url:return jsonify({"error":"image url required"}),400
+    try:
+        rendered=_image_square_bytes(_image_download(url),mode,1080)
+        return send_file(BytesIO(rendered),mimetype="image/jpeg",download_name="image-1080.jpg",max_age=3600)
+    except Exception as exc:
+        return jsonify({"error":str(exc)}),400
+
+
 @app.post("/upload_decal")
 def upload_decal():
     roblox_cookie = os.environ.get("ROBLOX_COOKIE", "").strip()
@@ -219,6 +475,8 @@ def upload_decal():
     decal_name = (data.get("name") or "Karaoke Cover").strip()[:40]
     if not image_url and not image_b64:
         return jsonify({"error": "image_url or image_base64 required"}), 400
+    if image_url and data.get("square_mode") and not _image_host_allowed(image_url):
+        return jsonify({"error": "Image host is not allowed for square rendering"}), 400
 
     try:
         if image_b64:
@@ -231,12 +489,26 @@ def upload_decal():
             content_type = (data.get("content_type") or "image/png").split(";")[0]
             file_name = (data.get("filename") or "cover.png")
         else:
-            img_resp = requests.get(image_url, timeout=20)
-            if img_resp.status_code != 200:
-                return jsonify({"error": f"Failed to download image: HTTP {img_resp.status_code}"}), 400
-            content_type = img_resp.headers.get("Content-Type", "image/png").split(";")[0]
-            img_bytes = img_resp.content
+            if data.get("square_mode"):
+                img_bytes = _image_download(image_url)
+                content_type = "image/jpeg"
+            else:
+                img_resp = requests.get(image_url, timeout=20)
+                if img_resp.status_code != 200:
+                    return jsonify({"error": f"Failed to download image: HTTP {img_resp.status_code}"}), 400
+                content_type = img_resp.headers.get("Content-Type", "image/png").split(";")[0]
+                if len(img_resp.content) > _IMAGE_MAX_BYTES:
+                    return jsonify({"error": "Image exceeds 20 MB limit"}), 400
+                img_bytes = img_resp.content
             file_name = "cover.png"
+
+        square_mode = (data.get("square_mode") or "").strip()
+        if square_mode:
+            if square_mode not in ("crop", "fit_blur", "fit_black"):
+                square_mode = "crop"
+            img_bytes = _image_square_bytes(img_bytes, square_mode, 1080)
+            content_type = "image/jpeg"
+            file_name = "cover-1080.jpg"
 
         session = requests.Session()
         session.cookies[".ROBLOSECURITY"] = roblox_cookie
