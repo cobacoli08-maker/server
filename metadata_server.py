@@ -243,6 +243,8 @@ _IMAGE_ALLOWED_SUFFIXES = (
     "vocadb.net", "anilist.co", "anilistcdn.com",
     "myanimelist.net", "mal-cdn.net",
     "coverartarchive.org", "archive.org",
+    "mzstatic.com", "dzcdn.net", "wikimedia.org",
+    "pinimg.com",
 )
 _IMAGE_MAX_BYTES = 20 * 1024 * 1024
 _IMAGE_USER_AGENT = "KaraokeStudio-ImageFinder/1.0 (contact: app-owner)"
@@ -283,7 +285,9 @@ def _image_candidate(source,title,url,preview_url="",source_url="",subtitle="",k
         "source":source,"title":str(title or "Untitled"),"subtitle":str(subtitle or ""),
         "image_url":str(url),"preview_url":str(preview_url or url),
         "source_url":str(source_url or url),"kind":kind,
-        "width":int(width or 0),"height":int(height or 0),"score":float(score or 0),
+        "width":int(width or 0),"height":int(height or 0),
+        "output_width":1080,"output_height":1080,
+        "score":float(score or 0),
     }
 
 
@@ -306,7 +310,7 @@ def _image_search_youtube(query):
             best=max((x for x in thumbs if isinstance(x,dict)),key=lambda x:int(x.get("width") or 0)*int(x.get("height") or 0),default={})
             item=_image_candidate(source,row.get("title"),image,raw,link,artists,
                                   "music_artwork" if filt=="songs" else "video_thumbnail",
-                                  best.get("width"),best.get("height"),base_score-index)
+                                  1080,1080,base_score-index)
             if item:out.append(item)
     return out
 
@@ -392,6 +396,95 @@ def _image_search_coverart(query):
     return out
 
 
+def _itunes_artwork_1200(url):
+    """Build Apple's documented artwork CDN variant from a Search API artwork URL."""
+    value=str(url or "").strip()
+    if not value:return ""
+    value=re.sub(r"/\d+x\d+(?:bb)?(?:-[^/.]+)?\.(jpg|png)$",r"/1200x1200bb.\1",value,flags=re.I)
+    return value.replace("http://","https://",1)
+
+
+def _image_search_itunes(query):
+    resp=requests.get("https://itunes.apple.com/search",params={
+        "term":query,"media":"music","entity":"song","limit":24,"country":"JP"
+    },headers={"User-Agent":_IMAGE_USER_AGENT},timeout=12)
+    if resp.status_code!=200:raise RuntimeError("iTunes Search HTTP %s"%resp.status_code)
+    out=[]
+    for index,row in enumerate((resp.json() or {}).get("results") or []):
+        url=_itunes_artwork_1200(row.get("artworkUrl100") or row.get("artworkUrl60"))
+        cand=_image_candidate("Apple / iTunes",row.get("trackName") or row.get("collectionName"),url,url,
+                              row.get("trackViewUrl") or row.get("collectionViewUrl"),
+                              row.get("artistName") or "","album_cover",1200,1200,96-index*.35)
+        if cand:out.append(cand)
+    return out
+
+
+def _image_search_deezer(query):
+    resp=requests.get("https://api.deezer.com/search",params={"q":query,"limit":24},
+                      headers={"User-Agent":_IMAGE_USER_AGENT},timeout=12)
+    if resp.status_code!=200:raise RuntimeError("Deezer HTTP %s"%resp.status_code)
+    payload=resp.json() or {}
+    if payload.get("error"):raise RuntimeError("Deezer: %s"%payload.get("error"))
+    out=[]
+    for index,row in enumerate(payload.get("data") or []):
+        album=row.get("album") or {};artist=row.get("artist") or {}
+        url=album.get("cover_xl") or album.get("cover_big") or album.get("cover")
+        cand=_image_candidate("Deezer",row.get("title") or album.get("title"),url,url,
+                              row.get("link") or "",artist.get("name") or "",
+                              "album_cover",1000,1000,94-index*.35)
+        if cand:out.append(cand)
+    return out
+
+
+def _image_search_wikimedia(query):
+    resp=requests.get("https://commons.wikimedia.org/w/api.php",params={
+        "action":"query","generator":"search","gsrsearch":query,"gsrnamespace":6,
+        "gsrlimit":24,"prop":"imageinfo","iiprop":"url|size|mime","iiurlwidth":1600,
+        "format":"json","origin":"*"
+    },headers={"User-Agent":_IMAGE_USER_AGENT},timeout=15)
+    if resp.status_code!=200:raise RuntimeError("Wikimedia HTTP %s"%resp.status_code)
+    pages=((resp.json() or {}).get("query") or {}).get("pages") or {}
+    out=[]
+    for index,row in enumerate(sorted(pages.values(),key=lambda x:x.get("index",999))):
+        info=(row.get("imageinfo") or [{}])[0];mime=str(info.get("mime") or "")
+        width=int(info.get("width") or 0);height=int(info.get("height") or 0)
+        if mime not in ("image/jpeg","image/png","image/webp") or min(width,height)<1080:continue
+        url=info.get("thumburl") or info.get("url");preview=info.get("thumburl") or url
+        name=re.sub(r"^File:","",row.get("title") or "",flags=re.I)
+        source_url=info.get("descriptionurl") or info.get("descriptionshorturl") or ""
+        thumb_width=int(info.get("thumbwidth") or width);thumb_height=int(info.get("thumbheight") or height)
+        cand=_image_candidate("Wikimedia Commons",name,url,preview,source_url,
+                              "%s×%s original"%(width,height),"open_licensed",
+                              thumb_width,thumb_height,80-index*.25)
+        if cand:out.append(cand)
+    return out
+
+
+def _image_search_pinterest(query):
+    """Official Pinterest API beta. Enabled only with an approved access token."""
+    token=(os.environ.get("PINTEREST_ACCESS_TOKEN") or "").strip()
+    if not token:return []
+    resp=requests.get("https://api.pinterest.com/v5/search/partner/pins",params={
+        "term":query,"country_code":os.environ.get("PINTEREST_COUNTRY_CODE","US"),
+        "locale":os.environ.get("PINTEREST_LOCALE","en-US"),"limit":25
+    },headers={"Authorization":"Bearer "+token,"Accept":"application/json",
+               "User-Agent":_IMAGE_USER_AGENT},timeout=15)
+    if resp.status_code!=200:raise RuntimeError("Pinterest API HTTP %s"%resp.status_code)
+    out=[]
+    for index,row in enumerate((resp.json() or {}).get("items") or []):
+        images=((row.get("media") or {}).get("images") or {})
+        choices=[v for v in images.values() if isinstance(v,dict) and v.get("url")]
+        best=max(choices,key=lambda x:int(x.get("width") or 0)*int(x.get("height") or 0),default={})
+        url=best.get("url") or ""
+        pin_id=str(row.get("id") or "")
+        cand=_image_candidate("Pinterest",row.get("title") or row.get("description") or "Pinterest image",
+                              url,url,("https://www.pinterest.com/pin/"+pin_id+"/") if pin_id else "",
+                              row.get("alt_text") or "","pin",
+                              best.get("width"),best.get("height"),76-index*.25)
+        if cand:out.append(cand)
+    return out
+
+
 @app.get("/image/search")
 def image_search():
     request_id=_img_id("search");query=(request.args.get("q") or "").strip()
@@ -399,7 +492,18 @@ def image_search():
     if not query:return _img_error("IMG-SEARCH-EMPTY","Search query empty",400,request_id)
     key="image-search-debug:"+query.casefold();cached=_image_cache_get(key)
     if cached is not None:return _img_response({"results":cached,"cached":True,"source_status":[]},200,request_id)
-    providers=[("YouTube","IMG-SOURCE-YOUTUBE",_image_search_youtube),("VocaDB","IMG-SOURCE-VOCADB",_image_search_vocadb),("AniList","IMG-SOURCE-ANILIST",_image_search_anilist),("Jikan","IMG-SOURCE-JIKAN",_image_search_jikan),("Cover Art Archive","IMG-SOURCE-COVERART",_image_search_coverart)]
+    providers=[
+        ("Apple / iTunes","IMG-SOURCE-ITUNES",_image_search_itunes),
+        ("Deezer","IMG-SOURCE-DEEZER",_image_search_deezer),
+        ("YouTube","IMG-SOURCE-YOUTUBE",_image_search_youtube),
+        ("VocaDB","IMG-SOURCE-VOCADB",_image_search_vocadb),
+        ("AniList","IMG-SOURCE-ANILIST",_image_search_anilist),
+        ("Jikan","IMG-SOURCE-JIKAN",_image_search_jikan),
+        ("Cover Art Archive","IMG-SOURCE-COVERART",_image_search_coverart),
+        ("Wikimedia Commons","IMG-SOURCE-WIKIMEDIA",_image_search_wikimedia),
+    ]
+    if (os.environ.get("PINTEREST_ACCESS_TOKEN") or "").strip():
+        providers.append(("Pinterest","IMG-SOURCE-PINTEREST",_image_search_pinterest))
     results=[];source_status=[]
     def run(provider):
         label,code,fn=provider;started=time.time()
@@ -415,7 +519,7 @@ def image_search():
         identity=re.sub(r"=(?:w|s)\d+(?:-[A-Za-z0-9]+)*$","",item.get("image_url","")).lower()
         if identity in seen:continue
         seen.add(identity);dedup.append(item)
-    dedup=dedup[:60];_image_cache_set(key,dedup,900);_img_log("IMG-SEARCH-DONE",request_id,result_count=len(dedup))
+    dedup=dedup[:120];_image_cache_set(key,dedup,900);_img_log("IMG-SEARCH-DONE",request_id,result_count=len(dedup))
     return _img_response({"results":dedup,"cached":False,"source_status":source_status},200,request_id)
 
 
